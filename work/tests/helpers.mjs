@@ -20,6 +20,11 @@ export async function boot(extraBindings = {}) {
   const mf = new Miniflare({
     modules: true,
     scriptPath: SCRIPT,
+    // Resolve the module name relative to the bundle's own directory. Without this,
+    // a bundle that lives outside the cwd (CI: <repo>/dist while cwd is <repo>/work)
+    // becomes '../dist/worker.js' and workerd refuses it ("can't use '..' to break out
+    // of starting directory").
+    modulesRoot: path.dirname(SCRIPT),
     compatibilityDate: '2025-01-01',
     compatibilityFlags: ['nodejs_compat'],
     d1Databases: { DB: 'qv-itest' },

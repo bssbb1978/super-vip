@@ -64,6 +64,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: true
@@ -77,10 +80,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install javascript-obfuscator
-        run: npm install --no-save javascript-obfuscator@^4
+        run: npm install --no-save --no-audit --no-fund javascript-obfuscator@^4
 
       - name: Embed build metadata (before obfuscation, not after)
         # Doing this *before* obfuscation means the version comment is part
@@ -135,12 +138,20 @@ jobs:
         # (D1 + KV) isolate, exactly like tests/helpers.mjs already does for
         # the plain build — so a break here fails the job before deploy ever
         # runs, instead of failing silently in production.
+        #
+        # The bundle is copied INSIDE work/ first: workerd rejects a module
+        # path that climbs out of the working directory ("can't use '..' to
+        # break out of starting directory"), which is what happened when
+        # QV_SCRIPT pointed at <repo>/dist/worker.js while cwd was <repo>/work.
+        # tests/helpers.mjs now also sets modulesRoot, so either layout works.
         working-directory: work
         env:
-          QV_SCRIPT: ${{ github.workspace }}/dist/worker.js
+          QV_SCRIPT: ${{ github.workspace }}/work/dist/worker.js
         run: |
           set -euo pipefail
-          npm ci
+          mkdir -p dist
+          cp ../dist/worker.js dist/worker.js
+          npm ci --no-audit --no-fund
           npx vitest run
 
       - name: Upload obfuscated bundle
@@ -170,7 +181,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Check required Cloudflare credentials are present
         run: |
@@ -184,7 +195,7 @@ jobs:
           fi
 
       - name: Install wrangler
-        run: npm install --no-save wrangler@^4
+        run: npm install --no-save --no-audit --no-fund wrangler@^4
 
       - name: Apply non-secret configuration from repository variables
         env:
