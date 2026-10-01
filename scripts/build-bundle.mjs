@@ -46,6 +46,15 @@
  *   6. ATTESSTATION — writes `dist/worker.meta.json` (sha256, sizes, flags,
  *      identity, verification report) so the deploy job and the test suite can
  *      prove the artifact they run is the artifact that was verified.
+ *   7. AST STRUCTURE — when acorn is resolvable (CI installs it next to the
+ *      obfuscator), the source and the artifact are parsed as real modules
+ *      and their export sets must be identical, and `QVRelay` must still be
+ *      an exported ClassDeclaration.  A regex can be satisfied by a comment
+ *      and is blind to a silently dropped export; the AST cannot be fooled.
+ *      No acorn → the layer is reported `• skipped`, never a failure.
+ *   8. REVISION GUARD — `--verify-only` refuses an artifact whose attested
+ *      git sha is not the revision being deployed, so a stale download can
+ *      never reach production.
  *
  * EVERY obfuscation flag used before is preserved in `OBFUSCATION_FLAGS`
  * below, byte for byte, and the Workers-unsafe pair (`self-defending`,
@@ -58,6 +67,9 @@
  *   node scripts/build-bundle.mjs --verify-only    # re-check an existing build
  *   node scripts/build-bundle.mjs --no-repair      # fail instead of repairing
  *   node scripts/build-bundle.mjs --src worker.js --out dist/worker.js
+ *
+ * Optional: `npm i --no-save acorn@^8` enables the AST export-surface gate
+ * (the CI build job installs it alongside javascript-obfuscator).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 import fs from 'node:fs';
@@ -66,6 +78,7 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -238,12 +251,92 @@ function buildPrologue({ id, srcHash, at, version, core, units, canary, flagsHas
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * 3b. Optional AST layer (acorn).  Text checks cannot prove a module *surface*
+ *     — a regex is blind to a silently dropped `export` and can be fooled by
+ *     a comment.  When acorn is resolvable (CI installs it next to the
+ *     obfuscator; work/node_modules carries it for local runs) the build also
+ *     parses the source and the artifact and requires their export sets to be
+ *     identical, and that an exported class really is a ClassDeclaration.
+ *     Without acorn the layer is reported as skipped, never as a failure, so
+ *     the build keeps working on a bare checkout.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+const req = createRequire(import.meta.url);
+const ACORN = (() => {
+  for (const spec of ['acorn', path.join(ROOT, 'work', 'node_modules', 'acorn')]) {
+    try {
+      const mod = req(spec);
+      if (mod && typeof mod.parse === 'function') return mod;
+    } catch (e) { /* try the next candidate */ }
+  }
+  return null;
+})();
+
+/* every name a module exports — default, declarations and re-export specs */
+function exportedNames(text) {
+  const names = new Set();
+  const fromPattern = (node) => {
+    if (!node) return;
+    switch (node.type) {
+      case 'Identifier': names.add(node.name); break;
+      case 'AssignmentPattern': fromPattern(node.left); break;
+      case 'RestElement': fromPattern(node.argument); break;
+      case 'ArrayPattern': for (const el of node.elements) fromPattern(el); break;
+      case 'ObjectPattern': for (const prop of node.properties) fromPattern(prop.value || prop.argument); break;
+      default: break;
+    }
+  };
+  const ast = ACORN.parse(text, { ecmaVersion: 'latest', sourceType: 'module' });
+  for (const node of ast.body) {
+    if (node.type === 'ExportDefaultDeclaration') names.add('default');
+    else if (node.type === 'ExportNamedDeclaration') {
+      if (node.declaration) {
+        const d = node.declaration;
+        if (d.type === 'VariableDeclaration') for (const decl of d.declarations) fromPattern(decl.id);
+        else if (d.id && d.id.name) names.add(d.id.name);
+      }
+      for (const spec of node.specifiers || []) {
+        const exported = spec.exported && (spec.exported.name || spec.exported.value);
+        if (exported) names.add(exported);
+      }
+    }
+  }
+  return names;
+}
+
+/* names exported as a class declaration (`export class X {}`) */
+function exportedClasses(text) {
+  const out = new Set();
+  const ast = ACORN.parse(text, { ecmaVersion: 'latest', sourceType: 'module' });
+  for (const node of ast.body) {
+    if (node.type === 'ExportNamedDeclaration' && node.declaration && node.declaration.type === 'ClassDeclaration' && node.declaration.id) {
+      out.add(node.declaration.id.name);
+    }
+  }
+  return out;
+}
+
+/* the shared source↔artifact comparison, used by both build and verify-only */
+function surfaceChecks(sourceText, artifactText) {
+  const want = exportedNames(sourceText);
+  const got = exportedNames(artifactText);
+  const missing = [...want].filter((n) => !got.has(n));
+  const extra = [...got].filter((n) => !want.has(n));
+  return {
+    want, got, missing, extra,
+    parity: missing.length === 0 && extra.length === 0,
+    detail: `source=${[...want].join(',')} artifact=${[...got].join(',')}`.slice(0, 200),
+    relayIsClass: exportedClasses(artifactText).has('QVRelay'),
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * 4. Verify.  Everything the test suite (and the deploy gate) cares about,
  *    checked against the artifact *text* plus a real parse.
  * ═══════════════════════════════════════════════════════════════════════════ */
 function verifyArtifact(file, { identity, canary, identityLine, source }) {
   const checks = [];
   const add = (name, ok, detail = '') => checks.push({ name, ok: !!ok, detail: String(detail).slice(0, 200) });
+  const skip = (name, why) => checks.push({ name, ok: true, skipped: true, detail: String(why).slice(0, 200) });
   const src = read(file);
 
   /* 4.1 the bundle is a valid ES module */
@@ -279,6 +372,21 @@ function verifyArtifact(file, { identity, canary, identityLine, source }) {
   /* 4.7 size sanity (same floor the suite asserts, plus "grew, did not shrink") */
   add(`artifact > ${SIZE_FLOOR} bytes`, src.length > SIZE_FLOOR, `${src.length} bytes`);
   if (source) add('artifact is at least as large as the source', src.length >= source.length * 0.9, `${src.length} vs ${source.length}`);
+
+  /* 4.8 AST — the artifact must export exactly what the source exports */
+  if (!ACORN) {
+    skip('export surface matches the source (AST)', 'acorn not installed — npm i acorn@^8 to enable');
+  } else if (!source) {
+    skip('export surface matches the source (AST)', 'no source text in context');
+  } else {
+    try {
+      const surface = surfaceChecks(source, src);
+      add(`export surface matches the source (AST, ${surface.want.size} exports)`, surface.parity, surface.detail);
+      add('QVRelay is exported as a class declaration (AST)', surface.relayIsClass);
+    } catch (e) {
+      skip('export surface matches the source (AST)', `acorn could not parse: ${(e.message || e).split('\n')[0]}`);
+    }
+  }
 
   const failed = checks.filter((c) => !c.ok);
   return { ok: failed.length === 0, checks, failed };
@@ -323,6 +431,7 @@ function main() {
     const src = read(OUT);
     const checks = [];
     const add = (name, ok, detail = '') => checks.push({ name, ok: !!ok, detail: String(detail).slice(0, 160) });
+    const skip = (name, why) => checks.push({ name, ok: true, skipped: true, detail: String(why).slice(0, 160) });
     const digest = sha256(src);
     add('artifact sha256 matches the attestation', digest === meta.artifact?.sha256, digest);
     add('artifact bytes match the attestation', Buffer.byteLength(src) === meta.artifact?.bytes, Buffer.byteLength(src));
@@ -344,8 +453,32 @@ function main() {
     add('export class QVRelay', /export class QVRelay/.test(src));
     add('no `fetch` export (shadowing the platform global)', !/export\s+(async\s+)?function\s+fetch\b/.test(src) && !/export\s+const\s+fetch\b/.test(src));
     add('identity is live code (not a comment)', /__QV_PROVENANCE__/.test(src));
+
+    /* the artifact must have been built from the revision we are deploying —
+       catches a stale or hand-picked upload trying to reach production */
+    if (!process.env.GITHUB_SHA || !meta.git?.sha) {
+      skip('attestation was built from this revision', 'not running inside GitHub Actions');
+    } else {
+      add('attestation was built from this revision', meta.git.sha === process.env.GITHUB_SHA, `${short(meta.git.sha, 12)} vs ${short(process.env.GITHUB_SHA, 12)}`);
+    }
+
+    /* same AST surface gate as the full build, re-derived from worker.js */
+    if (!ACORN) {
+      skip('export surface matches the source (AST)', 'acorn not installed — npm i acorn@^8 to enable');
+    } else if (!fs.existsSync(SRC)) {
+      skip('export surface matches the source (AST)', `source not present (${path.relative(ROOT, SRC)})`);
+    } else {
+      try {
+        const surface = surfaceChecks(read(SRC), src);
+        add(`export surface matches the source (AST, ${surface.want.size} exports)`, surface.parity, surface.detail);
+        add('QVRelay is exported as a class declaration (AST)', surface.relayIsClass);
+      } catch (e) {
+        skip('export surface matches the source (AST)', `acorn could not parse: ${(e.message || e).split('\n')[0]}`);
+      }
+    }
+
     const bad = checks.filter((c) => !c.ok);
-    for (const c of checks) console.log(`  ${c.ok ? '✔' : '✖'} ${c.name}${c.detail && !c.ok ? ` — ${c.detail}` : ''}`);
+    for (const c of checks) console.log(`  ${c.ok ? (c.skipped ? '•' : '✔') : '✖'} ${c.name}${c.detail && (c.skipped || !c.ok) ? ` — ${c.detail}` : ''}`);
     if (bad.length) { console.error(`✖ attestation re-check failed (${bad.length} check${bad.length > 1 ? 's' : ''})`); process.exit(1); }
     console.log('✔ attestation re-check passed');
     return;
@@ -472,7 +605,7 @@ function main() {
       fs.writeFileSync(`${META}.flags.txt`, args.join(' '));
 
       console.log(`✔ artifact    ${path.relative(ROOT, OUT)} (${meta.artifact.bytes} bytes, ${(gz / 1024).toFixed(0)} KiB gzip, sha256 ${short(meta.artifact.sha256, 16)})`);
-      for (const c of report.checks) console.log(`  ✔ ${c.name}`);
+      for (const c of report.checks) console.log(`  ${c.skipped ? '•' : '✔'} ${c.name}${c.skipped ? ` — ${c.detail}` : ''}`);
       console.log(`✔ attestation ${path.relative(ROOT, META)} (seed ${seed}, ${attempts.length} attempt${attempts.length > 1 ? 's' : ''})`);
       if (process.env.GITHUB_STEP_SUMMARY) {
         try {

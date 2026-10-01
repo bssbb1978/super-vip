@@ -41,6 +41,17 @@ name: Build, Obfuscate & Deploy
 #    a sha256 + identity + verification attestation that the deploy job
 #    re-checks before anything reaches Cloudflare.
 #
+# 7. All six action usages are bumped from `@v4` to the newest releases and
+#    pinned by full commit SHA (supply-chain-safe; `# vX.Y.Z` keeps them
+#    readable).  `@v4` ran on Node.js 20, which GitHub now annotates as
+#    deprecated; the pinned releases all declare `runs.using: node24`, so the
+#    annotation is gone at the source instead of being silenced.  NOTE:
+#    upload-artifact only became node24 at v6 and download-artifact at v7 —
+#    v5/v6 of those two still declare node20 and would keep the warning.
+#    A weekly Dependabot config (.github/dependabot.yml) now keeps both the
+#    actions and the work/ toolchain current, so the next deprecation arrives
+#    as a reviewed PR instead of a surprise annotation.
+#
 # Honesty note (matches the project's own house style of calling out
 # assumptions): "fully automatic, never errors" isn't a real guarantee for
 # a pipeline that talks to an external API (Cloudflare) over the network —
@@ -75,6 +86,11 @@ permissions:
   contents: read
 
 env:
+  # Every action below is pinned to a release whose action.yml declares
+  # `runs.using: node24`, so this is no longer needed to silence the
+  # "Node.js 20 is deprecated … forced to run on Node.js 24" annotation —
+  # it is kept as a belt-and-braces net so a future action that still ships
+  # on node20 can never resurrect the warning.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 concurrency:
@@ -85,15 +101,19 @@ jobs:
   # ── build + obfuscate + test — runs on every push and every PR ──────────
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 → runs.using: node24
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0 → runs.using: node24
         with:
           node-version: '22'
 
       - name: Install javascript-obfuscator
-        run: npm install --no-save --no-audit --no-fund javascript-obfuscator@^4
+        # acorn powers the build script's AST export-surface parity gate:
+        # without it that one check is skipped, with it the artifact must
+        # export exactly what worker.js exports.
+        run: npm install --no-save --no-audit --no-fund javascript-obfuscator@^4 acorn@^8
 
       - name: Embed build provenance + obfuscate (strong preset, Workers-safe)
         # This one step replaces the old "Embed build metadata" + "Obfuscate"
@@ -161,7 +181,7 @@ jobs:
           npx vitest run
 
       - name: Upload obfuscated bundle + attestation
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 → runs.using: node24
         with:
           name: worker-obfuscated-${{ github.sha }}
           path: |
@@ -174,20 +194,21 @@ jobs:
     needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     environment: ${{ github.event.inputs.deploy_env || 'production' }}
     env:
       DEPLOY_ENV: ${{ github.event.inputs.deploy_env || 'production' }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 → runs.using: node24
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 → runs.using: node24
         with:
           name: worker-obfuscated-${{ github.sha }}
           path: dist
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0 → runs.using: node24
         with:
           node-version: '22'
 
