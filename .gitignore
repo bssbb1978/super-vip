@@ -1,0 +1,12 @@
+# build inputs / outputs that must never be committed
+node_modules/
+dist/
+work/dist/
+work/node_modules/
+
+# build attestation side files
+*.flags.txt
+
+# local editor / OS noise
+.DS_Store
+*.log
