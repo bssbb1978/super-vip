@@ -295,18 +295,26 @@ describe('owner binding: the bot works with no ADMIN_TELEGRAM_ID', () => {
 
   test('the console exposes the access tab and its client handlers', async () => {
     const html = await (await qv.get('/admin', { headers: qv.auth() })).text();
-    /* the tab is rendered server-side; the handlers ship in the inline client */
+    /* Only markers that survive the *obfuscated* build are asserted on, because
+       CI runs this suite against dist/worker.js:
+         · `data-tab="access"` and the two subtitles are produced by the
+           server-side shell at request time, so they are plain output text;
+         · `ownerInvite` / `ownerRemove` are identifiers (object properties of
+           window.QV), which the obfuscator keeps.
+       A string literal such as `api('owner')` or `OWNER_LOCK` is deliberately
+       NOT asserted: build-bundle.mjs moves literals into an encoded string
+       array, so the source text legitimately disappears while the behaviour is
+       unchanged — asserting on it made this test fail only on the obfuscated
+       artifact.  The endpoint itself is covered by every test above. */
     expect(html).toContain('data-tab="access"');
     expect(html).toContain('ownerInvite');
     expect(html).toContain('ownerRemove');
-    expect(html).toContain("api('owner'");
-    expect(html).toContain('OWNER_LOCK');
+    expect(html).toContain('Quantum Veil Console');   // the authenticated shell
     /* an anonymous visitor gets the sign-in shell: the SPA source ships (it is
        one inline bundle), but no owner data is embedded in the page and every
        /api/owner call it would make is rejected — asserted above */
     const anon = await (await qv.get('/admin')).text();
     expect(anon).toContain('sign in');
-    expect(html).toContain('Quantum Veil Console');   // the authenticated shell
     expect(anon).not.toContain('Quantum Veil Console');
     for (const id of ['424242424', '3133731337', '515051505']) {
       expect(anon).not.toContain(id);

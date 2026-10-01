@@ -7570,16 +7570,20 @@ QV.dns = (() => {
       }
       return { ok: false, sent: 0, error: 'no owner bound' };
     }
-    let sent = 0; const failed = [];
+    let sent = 0, skipped = 0; const failed = [];
     /* `html:false` lets a legacy caller send plain text (the merged generations
        write Markdown, which must not be parsed as HTML) */
     const sendOpts = { silent: !!opts.silent, html: opts.html };
+    /* `except` keeps the actor from being told about their own action — the
+       chat that just claimed already got its confirmation a line earlier */
+    const skip = new Set((Array.isArray(opts.except) ? opts.except : opts.except ? [opts.except] : []).map(String));
     for (const id of ids) {
+      if (skip.has(String(id))) { skipped++; continue; }
       const r = await send(env, id, text, keyboard, sendOpts);
       if (r.ok) sent++; else failed.push(QV.owner ? QV.owner.mask(id) : id);
       await QV.sleep(45);   // Telegram's ~30 msg/s ceiling, per destination
     }
-    return { ok: sent > 0, sent, failed: failed.length, recipients: ids.length, errors: failed };
+    return { ok: sent > 0 || skipped > 0, sent, skipped, failed: failed.length, recipients: ids.length, errors: failed };
   };
 
   /** critical events: every owner/admin gets the alert, deduplicated per hour */
@@ -7762,18 +7766,19 @@ QV.dns = (() => {
     await FSM.clear(c.env, c.chat);
     const roleTxt = c.lang === 'en' ? r.role : (r.role === 'owner' ? 'مالک' : r.role === 'viewer' ? 'بیننده' : 'مدیر');
     const head = r.first ? tr(c.lang, 'claim_owner') : tr(c.lang, 'claim_ok', { role: roleTxt });
-    /* tell the other owners — never the raw id, always the masked form */
+    /* tell the *other* owners — never the raw id, always the masked form */
     if (c.ctx && c.ctx.waitUntil) {
       c.ctx.waitUntil(notifyAdmin(c.env,
         `🔐 <b>${r.first ? 'owner' : 'admin'}</b> ${c.lang === 'en' ? 'bound via Telegram' : 'از راه تلگرام متصل شد'}: <code>${QV.owner.mask(r.chat)}</code>\n` +
-        `${c.lang === 'en' ? 'Manage with' : 'مدیریت با'} /admins`, null, { via: 'claim' }).catch(() => {}));
+        `${c.lang === 'en' ? 'Manage with' : 'مدیریت با'} /admins`, null, { via: 'claim', except: r.chat }).catch(() => {}));
       /* anything that was queued while the node had no owner goes out now */
       c.ctx.waitUntil(flushQueue(c.env).catch(() => {}));
     }
     const st = await QV.owner.status(c.env);
-    const tail = `\n\n${c.lang === 'en' ? 'Bound admins' : 'مدیران متصل'}: ${st.owners + (st.admins.length - st.owners)} · ` +
-      `${c.lang === 'en' ? 'mode' : 'حالت'}: <code>${QV.esc(st.mode)}</code>` +
-      (st.queued_alerts ? `\n📥 ${st.queued_alerts} ${c.lang === 'en' ? 'queued alert(s) delivered' : 'هشدار در صف ارسال شد'}` : '');
+    const en = c.lang === 'en';
+    const tail = `\n\n${en ? 'Bound' : 'متصل'}: ${st.admins.length} (${st.owners} ${en ? 'owner' : 'مالک'}) · ` +
+      `${en ? 'mode' : 'حالت'}: <code>${QV.esc(st.mode)}</code>` +
+      (st.queued_alerts ? `\n📥 ${st.queued_alerts} ${en ? 'queued alert(s) delivered' : 'هشدار در صف ارسال شد'}` : '');
     return send(c.env, c.chat, head + tail, adminMenu(c.lang, r.role === 'owner'));
   };
 
