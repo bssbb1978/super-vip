@@ -40,9 +40,14 @@
  *    1. wrangler d1 create qvu-db          → put the id into wrangler.toml
  *    2. wrangler kv namespace create QVU_KV
  *    3. define secrets:  ADMIN_PASSWORD, JWT_SECRET, API_SECRET_TOKEN,
- *       TELEGRAM_BOT_TOKEN, ADMIN_TELEGRAM_ID, BRIDGE_SECRET
+ *       TELEGRAM_BOT_TOKEN, BRIDGE_SECRET
+ *       (ADMIN_TELEGRAM_ID is optional — see step 6)
  *    4. wrangler deploy
  *    5. open  https://<your-worker>/admin   (first run migrates the schema)
+ *    6. bind Telegram: tab 🔐 → "New claim code" → send `/claim CODE` in a
+ *       private chat with the bot.  That chat becomes the owner and is stored
+ *       in D1 (qv_admins), so no admin id ever lives in a secret, a var, a URL
+ *       or a log line.  See work/core/31-owner.js.
  *
  *  NOTE: no `worker.js` name tokens such as "vpn"/"proxy" are used in URLs,
  *  route names or UI strings — see the naming rules in the security section.
@@ -786,7 +791,13 @@ QV.d1 = (() => {
       if (c !== undefined) return c;
       const row = await one(env, 'SELECT value, expires_at FROM qv_kv WHERE key = ?', key);
       if (!row) { if (env?.KV) { const v = await QV.safeAsync(() => env.KV.get(key, 'json')); if (v != null) { QV.lru.set('kv:' + key, v); return v; } } return dflt; }
-      if (row.expires_at && row.expires_at / 1000 < Date.now()) return dflt;
+      /* `expires_at` is written in unix *seconds* (see `put` below, and the
+         dns-cache pruner in 27-dns-extra).  Comparing it against Date.now()
+         in milliseconds made every TTL'd row look expired the instant it was
+         read back from D1 — only the in-isolate LRU hid it, so FSM state,
+         dedupe markers and rate-limit counters silently reset across deploys
+         and isolates. */
+      if (row.expires_at && Number(row.expires_at) * 1000 < Date.now()) return dflt;
       const v = QV.safe(() => JSON.parse(row.value), row.value);
       QV.lru.set('kv:' + key, v);
       return v;

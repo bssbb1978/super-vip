@@ -52,6 +52,7 @@ const CORE_ORDER = [
   '25-dns.js',
   '27-dns-extra.js',
   '30-telegram.js',
+  '31-owner.js',
   '38-subs.js',
   '40-router.js',
   '42-api.js',

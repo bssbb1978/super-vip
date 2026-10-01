@@ -56,6 +56,20 @@ LOG_DEBUG = "0"                 # 1 = persist debug events (costs D1 rows)
 AI_LABEL = "0"                  # 1 = let Workers AI label anomalies (never scores)
 CLEAN_IP_CANDIDATES = ""        # optional extra CIDR list for the endpoint engine
 
+# ── owner binding (no ADMIN_TELEGRAM_ID needed) ──────────────────────────────
+# The Telegram control plane claims its operator instead of being configured:
+# open /admin → "Telegram access" → mint a single-use code → send
+# `/claim CODE` (or open the t.me deep link) in a *private* chat with the bot.
+# That chat becomes the owner and is stored in D1 (qv_admins), never in a var.
+OWNER_CLAIM_TTL_MIN = "30"      # how long a minted code stays valid (1–1440)
+OWNER_MAX_ADMINS = "8"          # hard cap on non-viewer rows in qv_admins
+OWNER_NOTIFY_QUEUE = "50"       # alerts parked in D1 while nobody is bound yet
+OWNER_LOCK = "0"                # 1 = refuse all claiming (env id only)
+# OWNER_PEPPER = ""             # optional: pin the HMAC pepper for codes and
+                                # id fingerprints.  Left empty it is derived from
+                                # your existing secrets, so it is stable across
+                                # isolates and redeploys without being stored.
+
 # ── scheduled jobs ───────────────────────────────────────────────────────────
 # ONE trigger.  The worker's own scheduler staggers its 19 jobs across the
 # minute and takes a D1 lock per job, so a second isolate can never run the
@@ -80,13 +94,21 @@ crons = ["* * * * *"]
 #   wrangler secret put JWT_SECRET               # session tokens
 #   wrangler secret put API_SECRET_TOKEN         # machine token (x-api-token)
 #   wrangler secret put TELEGRAM_BOT_TOKEN       # bot
-#   wrangler secret put ADMIN_TELEGRAM_ID        # where alerts go
 #   wrangler secret put TELEGRAM_WEBHOOK_SECRET  # optional; derived from the
 #                                                # token when it is absent
 #   wrangler secret put SS_MASTER_SECRET         # HKDF master for user keys
 #                                                # (optional: minted in KV)
 #   wrangler secret put BRIDGE_SECRET            # relay/edge pairing
 #   wrangler secret put SS_PASSWORD              # optional fixed credential
+#   wrangler secret put OWNER_PEPPER             # optional; pins the claim-code
+#                                                # HMAC pepper (see [vars])
+#
+#   ADMIN_TELEGRAM_ID is optional now.  The bot is claimed instead:
+#     1. open https://<your-domain>/admin and sign in
+#     2. tab 🔐 "Telegram access" → "New claim code"
+#     3. in a PRIVATE chat with the bot send:  /claim XXXXX-XXXXX
+#   That chat becomes the owner; alerts, approvals and the admin menus all
+#   resolve their recipients from D1 (qv_admins) from then on.
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STAGING — a second, fully separate deployment (own DB, own KV, own name)

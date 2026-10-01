@@ -5,8 +5,13 @@
 # wrangler fail later with a vague deploy error.
 set -euo pipefail
 
-required=(ADMIN_PASSWORD JWT_SECRET API_SECRET_TOKEN TELEGRAM_BOT_TOKEN ADMIN_TELEGRAM_ID SS_MASTER_SECRET BRIDGE_SECRET)
-optional=(TELEGRAM_WEBHOOK_SECRET SS_PASSWORD)
+# ADMIN_TELEGRAM_ID is NOT required any more: since the owner-binding module
+# (work/core/31-owner.js) the bot is *claimed* from an authenticated panel
+# session — POST /api/owner {action:"invite"} → /claim CODE in Telegram — and
+# the chat id is then stored in D1 (qv_admins) instead of in a secret.
+# Set it only if you prefer the old, explicit behaviour; it always wins.
+required=(ADMIN_PASSWORD JWT_SECRET API_SECRET_TOKEN TELEGRAM_BOT_TOKEN SS_MASTER_SECRET BRIDGE_SECRET)
+optional=(ADMIN_TELEGRAM_ID TELEGRAM_WEBHOOK_SECRET SS_PASSWORD OWNER_PEPPER)
 
 missing=()
 for name in "${required[@]}"; do

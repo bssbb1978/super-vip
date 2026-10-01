@@ -346,13 +346,34 @@ Return JSON with keys: shape, sni_pool, fragment{mode,size,delayMs,jitterMs}, pa
     return s > 0 ? { samples: s, ok: o, rate: o / s } : null;
   };
 
+  /**
+   * Recent success from the 5-minute windows (scope 'global', host rows are a
+   * separate scope).  The lifetime ratio in qv_ip_scores moves slowly: 2 000
+   * good historical samples hide 100 fresh failures (0.90 -> 0.86).  The window
+   * view only counts what happened inside [sinceMs, now], so a strategy is
+   * judged on the traffic it actually carried.
+   */
+  const recentRate = async (env, sinceMs) => {
+    const bucket = Math.floor(Math.max(0, sinceMs) / 300000) * 300;
+    const row = await QV.safeAsync(() => QV.d1.one(env,
+      'SELECT SUM(samples) s, SUM(ok) o FROM qv_ip_windows WHERE scope = ? AND bucket >= ?', 'global', bucket), null);
+    if (!row) return null;
+    const s = Number(row.s || 0), o = Number(row.o || 0);
+    return s > 0 ? { samples: s, ok: o, rate: o / s } : null;
+  };
+
   const recordStrategy = async (env, strat, rate, extra = {}) => {
     const hist = (await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:strategy:hist', []), [])) || [];
+    const before = await QV.safeAsync(() => recentRate(env, Date.now() - 60 * 60 * 1000), null);
     const entry = {
       v: strat.version || null, source: strat.source || extra.source || 'unknown',
       at: Date.now(), shape: strat.shape, fragment: strat.fragment ? strat.fragment.mode : null,
-      baseline: rate ? { samples: rate.samples, ok: rate.ok, rate: Math.round(rate.rate * 1000) / 1000 } : null,
+      baseline: rate ? { samples: rate.samples, ok: rate.ok, rate: Math.round(rate.rate * 1000) / 1000,
+        recent: before && before.samples >= 20 ? { samples: before.samples, rate: Math.round(before.rate * 1000) / 1000 } : null } : null,
       reason: strat.reason || extra.reason || null,
+      /* full, already-sanitised copy: a rollback must restore the strategy that
+         actually ran, not just its shape + fragment mode on top of defaults */
+      snap: QV.safe(() => JSON.parse(JSON.stringify(sanitizeStrategy(strat, DEFAULT_STRATEGY))), null),
     };
     const next = [...hist, entry].slice(-8);
     const written = await QV.safeAsync(() => QV.d1.Kv.put(env, 'qv:strategy:hist', next, 0), null);
@@ -370,14 +391,29 @@ Return JSON with keys: shape, sni_pool, fragment{mode,size,delayMs,jitterMs}, pa
     if (!rate) return { ok: true, skipped: 'no-measurement' };
     const last = hist[hist.length - 1], prev = hist[hist.length - 2];
     if (!last.baseline) return { ok: true, skipped: 'no-baseline' };
+    /* after a rollback the failed strategy is gone for good: judging the
+       restored one against the (already bad) rollback-time rate could bounce
+       the system back to the very strategy that just failed */
+    if (last.source === 'rollback') return { ok: true, skipped: 'post-rollback' };
     const since = Math.max(0, rate.samples - last.baseline.samples);
-    if (since < ROLLBACK_MIN_SAMPLES) return { ok: true, skipped: 'thin-evidence', since };
-    if (!(rate.rate < last.baseline.rate - ROLLBACK_DROP)) {
-      return { ok: true, verdict: 'kept', rate: Math.round(rate.rate * 1000) / 1000, since };
+    /* verdict on traffic carried since the strategy was applied (window view);
+       the lifetime ratio stays as the fallback when windows are too thin */
+    const recent = await QV.safeAsync(() => recentRate(env, last.at || 0), null);
+    let judged = rate.rate, judgedSince = since, baseRate = last.baseline.rate, via = 'lifetime';
+    if (recent && recent.samples >= ROLLBACK_MIN_SAMPLES) {
+      judged = recent.rate; judgedSince = recent.samples; via = 'window';
+      if (last.baseline.recent && last.baseline.recent.samples >= 20) baseRate = last.baseline.recent.rate;
     }
+    if (judgedSince < ROLLBACK_MIN_SAMPLES) return { ok: true, skipped: 'thin-evidence', since: judgedSince };
+    if (!(judged < baseRate - ROLLBACK_DROP)) {
+      return { ok: true, verdict: 'kept', rate: Math.round(judged * 1000) / 1000, since: judgedSince, via };
+    }
+    rate.rate = judged; last.baseline = { ...last.baseline, rate: baseRate };
     /* roll back to the previous strategy — through the same sanitizer, so a
        restored value is clamped exactly like a fresh proposal */
-    const restored = sanitizeStrategy(prev, DEFAULT_STRATEGY);
+    /* prefer the full snapshot (re-sanitised on the way out); entries written by
+       older builds have no snapshot and keep the previous behaviour */
+    const restored = sanitizeStrategy(prev && prev.snap ? prev.snap : prev, DEFAULT_STRATEGY);
     restored.version = (state.strategy.version || 0) + 1;
     restored.updated_at = Date.now();
     restored.source = 'rollback';
@@ -389,7 +425,7 @@ Return JSON with keys: shape, sni_pool, fragment{mode,size,delayMs,jitterMs}, pa
     await recordStrategy(env, restored, rate, { source: 'rollback', reason: restored.reason });
     QV.count('ci_strategy_rollback', 1);
     QV.emit(env, 'ai:strategy', 'warn', { message: restored.reason, meta: { from: last.v, rate: rate.rate, baseline: last.baseline.rate } });
-    return { ok: true, verdict: 'rolled-back', to: restored.version, rate: Math.round(rate.rate * 1000) / 1000, baseline: last.baseline.rate, since };
+    return { ok: true, verdict: 'rolled-back', to: restored.version, rate: Math.round(rate.rate * 1000) / 1000, baseline: last.baseline.rate, since: judgedSince, via };
   };
 
   const load = async (env) => {
@@ -412,6 +448,6 @@ Return JSON with keys: shape, sni_pool, fragment{mode,size,delayMs,jitterMs}, pa
 
   return { sniPools, carriers, shapes, DEFAULT_STRATEGY, state, isProbe, tarpit, pickSni, scoreSni,
     fragmentProfile, profileFor, analyse, load, describe, markBlocked, activeCarrier,
-    sanitizeStrategy, heuristicStrategy, FRAG_MODES, evaluateStrategy, recordStrategy, measuredRate,
+    sanitizeStrategy, heuristicStrategy, FRAG_MODES, evaluateStrategy, recordStrategy, measuredRate, recentRate,
     ROLLBACK_DROP, ROLLBACK_MIN_SAMPLES };
 })();

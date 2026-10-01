@@ -89,12 +89,14 @@
         add:'کاربر جدید',run:'اجرا',refresh:'به‌روزرسانی',search:'جستجو',total:'کل کاربران',online:'آنلاین',traffic:'ترافیک',
         quota:'سهمیه',status:'وضعیت',actions:'عملیات',revive:'فعال‌سازی',kill:'قطع کانفیگ',del:'حذف',sub:'لینک اشتراک',
         copy:'کپی',ask:'بپرسید…',send:'ارسال',download:'دانلود',restore:'بازیابی',yes:'بله',no:'خیر',
+        access:'دسترسی تلگرام',
         hint:'برای دیدن کانفیگ روی «لینک اشتراک» بزنید.'},
     en:{dash:'Dashboard',users:'Users',sessions:'Sessions',strategy:'Anti-DPI',sni:'SNI Pool',ips:'Clean IPs',dns:'DNS',
         ai:'AI Copilot',logs:'Events',backup:'Backup',test:'Self-test',logout:'Sign out',login:'Sign in',save:'Save',
         add:'New user',run:'Run',refresh:'Refresh',search:'Search',total:'Users',online:'Online',traffic:'Traffic',
         quota:'Quota',status:'Status',actions:'Actions',revive:'Revive',kill:'Cut config',del:'Delete',sub:'Sub link',
         copy:'Copy',ask:'Ask…',send:'Send',download:'Download',restore:'Restore',yes:'Yes',no:'No',
+        access:'Telegram access',
         hint:'Click "Sub link" to reveal a config.'}
   };
   const t = (k) => (T[state.lang]||T.fa)[k] || k;
@@ -229,6 +231,42 @@
         <div class="card"><h3>${t('restore')}</h3><textarea id="restoreBox" rows="9" placeholder='{"users":[…]}'></textarea>
         <div class="row" style="margin-top:10px"><button class="warn" onclick="QV.restore()">${t('restore')}</button></div></div>
       </div>`,
+    access: async () => {
+      const s = await api('owner');
+      const fa = state.lang === 'fa';
+      const rows = (s.admins||[]).map(a => `<tr>
+        <td><code>${esc(a.id)}</code></td>
+        <td><span class="pill ${a.role==='owner'?'on':''}">${esc(a.role)}</span></td>
+        <td class="muted">${esc(a.source==='env'?(fa?'متغیر محیطی':'env var'):(fa?'اتصال خودکار':'claimed'))}</td>
+        <td class="muted">${esc(a.name||'—')}</td>
+        <td>${a.source==='env'?'<span class="muted">🔒</span>':`<button class="sm bad" onclick="QV.ownerRemove('${esc(a.fp)}','${esc(a.id)}')">${t('del')}</button>`}</td></tr>`).join('');
+      return `<div class="grid g2">
+        <div class="card"><h3>${fa?'اتصال تلگرام':'Telegram binding'}</h3>
+          <div class="sub" style="margin-bottom:10px">${fa
+            ? 'این گره به <b>ADMIN_TELEGRAM_ID</b> نیازی ندارد. یک کد یک‌بارمصرف بسازید و در تلگرام <code>/claim CODE</code> بفرستید؛ چت شما به‌صورت خودکار مالک می‌شود. شناسهٔ شما هرگز به‌صورت متن آشکار در کد، URL یا لاگ ظاهر نمی‌شود.'
+            : 'This node needs <b>no ADMIN_TELEGRAM_ID</b>. Mint a single-use code, then send <code>/claim CODE</code> in Telegram — that chat becomes the owner automatically. Your id is never stored or shown in clear text.'}</div>
+          ${kv(fa?'حالت':'mode', s.mode)}
+          ${kv(fa?'مالک':'owner', s.claimed ? s.owner : (fa?'— هنوز متصل نشده':'— unclaimed'))}
+          ${kv(fa?'کدهای در انتظار':'pending codes', s.pending_codes)}
+          ${kv(fa?'هشدارهای در صف':'queued alerts', s.queued_alerts)}
+          ${s.locked?`<div class="bad sub" style="margin-top:8px">🔒 OWNER_LOCK=1</div>`:''}
+          <div class="row" style="margin-top:12px">
+            <button onclick="QV.ownerInvite()">${fa?'🔑 ساخت کد اتصال':'🔑 New claim code'}</button>
+            <button class="ghost" onclick="QV.ownerRotate()">${fa?'♻️ باطل کردن کدها':'♻️ Revoke codes'}</button>
+          </div>
+          <div id="ownerCode" class="sub" style="margin-top:10px"></div>
+        </div>
+        <div class="card"><div class="row"><h3 style="margin:0">${fa?'مدیران':'Admins'} (${(s.admins||[]).length})</h3><div class="sp"></div>
+          <button class="sm ghost" onclick="QV.ownerAdd()">+ ${fa?'افزودن با شناسه':'Add by id'}</button></div>
+          <div style="overflow:auto;margin-top:12px"><table><thead><tr>
+          <th>ID</th><th>${fa?'نقش':'Role'}</th><th>${fa?'منبع':'Source'}</th><th>${fa?'نام':'Name'}</th><th></th>
+          </tr></thead><tbody>${rows||`<tr><td colspan="5" class="muted">${esc(s.owner_none||'—')}</td></tr>`}</tbody></table></div>
+          <div class="sub" style="margin-top:10px">${fa
+            ? 'نقش‌ها: <b>owner</b> (همه‌چیز + مدیریت دسترسی)، <b>admin</b> (همه‌چیز جز مدیریت دسترسی)، <b>viewer</b> (فقط آمار).'
+            : 'Roles: <b>owner</b> (everything + access control), <b>admin</b> (everything but access control), <b>viewer</b> (read-only).'}</div>
+        </div>
+      </div>`;
+    },
     test: async () => `<div class="grid g2">
         <div class="card"><div class="row"><h3 style="margin:0">${t('test')}</h3><div class="sp"></div>
         <button onclick="QV.selftest(1)">${state.lang==='fa'?'اجرای کامل':'Run full'}</button></div>
@@ -326,6 +364,45 @@
       catch(e){ toast(e.message,'bad'); } },
     filterUsers: (q) => { q = q.toLowerCase(); $$('#urows tr').forEach(tr => tr.classList.toggle('hidden', !tr.dataset.name.toLowerCase().includes(q))); },
     copy: async (txt) => { try { await navigator.clipboard.writeText(txt); toast('copied'); } catch(e){ prompt('copy', txt); } },
+    /* ── Telegram owner binding ───────────────────────────────────────────
+       The code is rendered once, in this tab, and never persisted anywhere:
+       not in localStorage, not in the URL, not in a log line. */
+    ownerInvite: async () => {
+      const box = $('#ownerCode'); if (box) box.innerHTML = '…';
+      try {
+        const r = await api('owner', { method:'POST', body:{ action:'invite' } });
+        const fa = state.lang === 'fa';
+        if (box) box.innerHTML =
+          `<div class="card" style="margin:0;background:#0a0f20">
+             <div class="sub">${fa?'کد یک‌بارمصرف — فقط یک بار قابل استفاده است':'Single-use code — valid once'}</div>
+             <div class="code" style="font-size:18px;letter-spacing:2px">${esc(r.code)}</div>
+             <div class="sub" style="margin-top:6px">${fa?'اعتبار':'expires in'}: ${esc(r.ttl_min)} ${fa?'دقیقه':'min'} · ${esc(r.note||'')}</div>
+             <div class="row" style="margin-top:8px">
+               <button class="sm" onclick="QV.copy('${esc(r.code)}')">${t('copy')}</button>
+               <button class="sm ghost" onclick="QV.copy('/claim ${esc(r.code)}')">${fa?'کپی دستور':'Copy command'}</button>
+               ${r.link?`<a class="btn sm ghost" href="${esc(r.link)}" target="_blank" rel="noopener">${fa?'📲 بازکردن در تلگرام':'📲 Open in Telegram'}</a>`:''}
+             </div>
+           </div>`;
+        toast(fa ? 'کد ساخته شد' : 'claim code minted');
+      } catch(e) { if (box) box.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; toast(e.message,'bad'); }
+    },
+    ownerRotate: async () => { try { const r = await api('owner',{method:'POST',body:{action:'rotate'}});
+      toast((state.lang==='fa'?'باطل شد: ':'revoked: ')+(r.revoked||0)); PANEL.render(); } catch(e){ toast(e.message,'bad'); } },
+    ownerAdd: async () => {
+      const fa = state.lang === 'fa';
+      const id = prompt(fa?'شناسهٔ عددی تلگرام:':'Numeric Telegram id:'); if(!id) return;
+      const role = prompt(fa?'نقش (owner/admin/viewer):':'Role (owner/admin/viewer):','admin')||'admin';
+      try { const r = await api('owner',{method:'POST',body:{action:'add',telegram_id:id.trim(),role:role.trim()}});
+        if (r && r.ok === false) throw new Error(r.error||'failed');
+        toast(fa?'اضافه شد':'added'); PANEL.render(); } catch(e){ toast(e.message,'bad'); }
+    },
+    ownerRemove: async (fp, shown) => {
+      /* the button carries the non-reversible fingerprint, never the real id */
+      if(!confirm((state.lang==='fa'?'دسترسی حذف شود؟ ':'Revoke access? ')+(shown||fp))) return;
+      try { const r = await api('owner/'+encodeURIComponent(String(fp||'')),{method:'DELETE'});
+        if (r && r.ok === false) throw new Error(r.error||'failed');
+        toast(state.lang==='fa'?'حذف شد':'revoked'); PANEL.render(); } catch(e){ toast(e.message,'bad'); }
+    },
   });
 
   window.addEventListener('DOMContentLoaded', async () => {
@@ -358,7 +435,7 @@
   const shell = (opts = {}) => {
     const lang = opts.lang === 'en' ? 'en' : 'fa';
     const dir = lang === 'fa' ? 'rtl' : 'ltr';
-    const tabs = [['dash', '📊'], ['users', '👥'], ['sessions', '🔌'], ['strategy', '🛡'], ['sni', '🎭'], ['ips', '🌐'], ['dns', '🧭'], ['ai', '🤖'], ['logs', '📜'], ['backup', '💾'], ['test', '🧪']];
+    const tabs = [['dash', '📊'], ['users', '👥'], ['sessions', '🔌'], ['strategy', '🛡'], ['sni', '🎭'], ['ips', '🌐'], ['dns', '🧭'], ['ai', '🤖'], ['logs', '📜'], ['access', '🔐'], ['backup', '💾'], ['test', '🧪']];
     return `<!doctype html><html lang="${lang}" dir="${dir}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow"><meta name="color-scheme" content="dark">
