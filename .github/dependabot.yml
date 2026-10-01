@@ -1,0 +1,63 @@
+# ──────────────────────────────────────────────────────────────────────────
+# Dependabot — keeps the pipeline from ever going stale again.
+#
+# Why this file exists: the build job was previously pinned to `actions/*@v4`,
+# which still ran on Node.js 20, and GitHub started annotating every run with
+# "Node.js 20 is deprecated".  The fix in the workflow was to move every
+# action to a release that declares `runs.using: node24`; this config makes
+# sure the next deprecation — or security advisory — arrives as a normal,
+# CI-tested pull request instead of a surprise annotation months later.
+#
+# Both ecosystems are covered:
+#   * github-actions — every `uses:` in .github/workflows/*.yml
+#   * npm at /work    — the test toolchain (vitest, miniflare, esbuild, …)
+# The root has no package.json (the obfuscator is installed ad hoc by the
+# build job), so there is nothing to track there.
+# ──────────────────────────────────────────────────────────────────────────
+version: 2
+updates:
+  # ── workflow actions ────────────────────────────────────────────────────
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:00'
+      timezone: UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'ci'
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      # one PR per week for all patch/minor action bumps — including SHA-pinned
+      # actions, whose `# vX.Y.Z` comment Dependabot rewrites in place
+      actions-minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  # ── the work/ test toolchain ────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: /work
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:00'
+      timezone: UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'deps(work)'
+    labels:
+      - dependencies
+      - npm
+    groups:
+      work-minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch

@@ -31,6 +31,27 @@ name: Build, Obfuscate & Deploy
 #    (`QVRelay`, the Durable Object class name wrangler.toml binds to, and
 #    `__QV_HANDLER`), so renaming never breaks the binding.
 #
+# 6. The obfuscation step is now scripts/build-bundle.mjs, which keeps every
+#    flag above byte-for-byte and adds: a pinned build-provenance constant
+#    (the reason tests/boot.test.mjs used to fail on the obfuscated artifact —
+#    the `46-selfcheck.js` marker lived only in a comment, and comments are
+#    stripped), a force-transformed canary that proves the string pipeline
+#    really ran, seeded retries around a javascript-obfuscator 4.2.2 bug that
+#    sometimes emits an unparseable class body, and dist/worker.meta.json —
+#    a sha256 + identity + verification attestation that the deploy job
+#    re-checks before anything reaches Cloudflare.
+#
+# 7. All six action usages are bumped from `@v4` to the newest releases and
+#    pinned by full commit SHA (supply-chain-safe; `# vX.Y.Z` keeps them
+#    readable).  `@v4` ran on Node.js 20, which GitHub now annotates as
+#    deprecated; the pinned releases all declare `runs.using: node24`, so the
+#    annotation is gone at the source instead of being silenced.  NOTE:
+#    upload-artifact only became node24 at v6 and download-artifact at v7 —
+#    v5/v6 of those two still declare node20 and would keep the warning.
+#    A weekly Dependabot config (.github/dependabot.yml) now keeps both the
+#    actions and the work/ toolchain current, so the next deprecation arrives
+#    as a reviewed PR instead of a surprise annotation.
+#
 # Honesty note (matches the project's own house style of calling out
 # assumptions): "fully automatic, never errors" isn't a real guarantee for
 # a pipeline that talks to an external API (Cloudflare) over the network —
@@ -65,6 +86,11 @@ permissions:
   contents: read
 
 env:
+  # Every action below is pinned to a release whose action.yml declares
+  # `runs.using: node24`, so this is no longer needed to silence the
+  # "Node.js 20 is deprecated … forced to run on Node.js 24" annotation —
+  # it is kept as a belt-and-braces net so a future action that still ships
+  # on node20 can never resurrect the warning.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 concurrency:
@@ -75,54 +101,53 @@ jobs:
   # ── build + obfuscate + test — runs on every push and every PR ──────────
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 → runs.using: node24
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0 → runs.using: node24
         with:
           node-version: '22'
 
       - name: Install javascript-obfuscator
-        run: npm install --no-save --no-audit --no-fund javascript-obfuscator@^4
+        # acorn powers the build script's AST export-surface parity gate:
+        # without it that one check is skipped, with it the artifact must
+        # export exactly what worker.js exports.
+        run: npm install --no-save --no-audit --no-fund javascript-obfuscator@^4 acorn@^8
 
-      - name: Embed build metadata (before obfuscation, not after)
-        # Doing this *before* obfuscation means the version comment is part
-        # of what gets parsed/transformed as a unit, instead of being spliced
-        # into an already-obfuscated file (which is what the old step did,
-        # and which breaks any integrity/self-check obfuscator feature).
-        run: |
-          set -euo pipefail
-          VERSION_LINE="// build ${GITHUB_SHA} - $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
-          { printf '%s\n' "$VERSION_LINE"; cat worker.js; } > worker.versioned.js
+      - name: Embed build provenance + obfuscate (strong preset, Workers-safe)
+        # This one step replaces the old "Embed build metadata" + "Obfuscate"
+        # pair.  It runs scripts/build-bundle.mjs, which keeps the *entire*
+        # transformation stack byte for byte (every flag below is still
+        # applied — see OBFUSCATION_FLAGS in the script) and adds what the
+        # inline command could not do:
+        #
+        #   * the build identity (every core part + every unit + git sha +
+        #     source and flag digests) is emitted as a real constant BEFORE
+        #     obfuscation and pinned with --reserved-strings, because the
+        #     previous pipeline only carried `46-selfcheck.js` inside a
+        #     banner comment — comments are stripped, so
+        #     tests/boot.test.mjs "the built artifact carries the full core
+        #     and every unit" failed on any obfuscated build;
+        #   * a force-transformed canary proves the string pipeline really
+        #     ran (a silently no-op obfuscation fails the gate);
+        #   * javascript-obfuscator 4.2.2 is nondeterministic on an input
+        #     this size and occasionally emits a class body no engine can
+        #     parse, so the script retries with another seed until the
+        #     artifact verifies (seeds are deterministic — the winning seed
+        #     is recorded and reused, making the build reproducible);
+        #   * dist/worker.meta.json records sha256, the seed, the flags and
+        #     the full verification report;
+        #   * only if an *identity* check fails does it fall back to an
+        #     inert provenance trailer comment.  Obfuscation is never
+        #     relaxed and an artifact that does not verify is never written.
+        run: node scripts/build-bundle.mjs
 
-      - name: Obfuscate (strong preset, Workers-safe)
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          npx javascript-obfuscator worker.versioned.js --output dist/worker.js \
-            --compact true \
-            --control-flow-flattening true \
-            --control-flow-flattening-threshold 0.4 \
-            --dead-code-injection true \
-            --dead-code-injection-threshold 0.2 \
-            --identifier-names-generator mangled \
-            --rename-globals false \
-            --string-array true \
-            --string-array-encoding base64 \
-            --string-array-threshold 0.75 \
-            --string-array-rotate true \
-            --string-array-shuffle true \
-            --split-strings true \
-            --split-strings-chunk-length 10 \
-            --transform-object-keys true \
-            --numbers-to-expressions true \
-            --simplify true \
-            --unicode-escape-sequence false \
-            --self-defending false \
-            --debug-protection false \
-            --disable-console-output false \
-            --reserved-names "^QVRelay$,^__QV_HANDLER$,^onRequest" \
-            --target browser
+      - name: Verify the build attestation (independent re-check)
+        # Re-reads dist/worker.meta.json, recomputes the artifact digest and
+        # re-runs the parse + identity checks.  Fails the job if the bytes on
+        # disk are not the bytes that were verified.
+        run: node scripts/build-bundle.mjs --verify-only
 
       - name: Validate the obfuscated bundle actually parses as a module
         run: |
@@ -151,14 +176,17 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp ../dist/worker.js dist/worker.js
+          cp ../dist/worker.meta.json dist/worker.meta.json
           npm ci --no-audit --no-fund
           npx vitest run
 
-      - name: Upload obfuscated bundle
-        uses: actions/upload-artifact@v4
+      - name: Upload obfuscated bundle + attestation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 → runs.using: node24
         with:
           name: worker-obfuscated-${{ github.sha }}
-          path: dist/worker.js
+          path: |
+            dist/worker.js
+            dist/worker.meta.json
           retention-days: 30
 
   # ── deploy — only on push to main or manual dispatch, never on a PR ─────
@@ -166,20 +194,21 @@ jobs:
     needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     environment: ${{ github.event.inputs.deploy_env || 'production' }}
     env:
       DEPLOY_ENV: ${{ github.event.inputs.deploy_env || 'production' }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 → runs.using: node24
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 → runs.using: node24
         with:
           name: worker-obfuscated-${{ github.sha }}
           path: dist
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0 → runs.using: node24
         with:
           node-version: '22'
 
@@ -194,8 +223,16 @@ jobs:
             exit 1
           fi
 
+      - name: Verify the artifact that is about to be deployed
+        # The attestation travels with the bundle; this re-check proves the
+        # bytes wrangler is about to upload are exactly the bytes the test
+        # suite passed against (sha256 + parse + identity).
+        run: node scripts/build-bundle.mjs --verify-only --meta dist/worker.meta.json --out dist/worker.js
+
       - name: Install wrangler
-        run: npm install --no-save --no-audit --no-fund wrangler@^4
+        # acorn is installed here as well so the deploy-time verify-only gate
+        # runs the AST export-surface check too, instead of skipping it
+        run: npm install --no-save --no-audit --no-fund wrangler@^4 acorn@^8
 
       - name: Apply non-secret configuration from repository variables
         env:
