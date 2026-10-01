@@ -224,6 +224,34 @@
     if (Array.isArray(list) && list.length) await QV.safeAsync(() => QV.d1.Kv.del(env, 'qv:owner:queue'), null);
     return Array.isArray(list) ? list : [];
   };
+  /** draining is not acknowledgement: an item that could not be handed to
+      Telegram (429, network, an owner removed mid-flush) goes back on the
+      queue, oldest first — but only up to OWNER_NOTIFY_TRIES attempts, so a
+      permanently broken destination cannot pin the queue forever */
+  const requeueAlerts = async (env, items) => {
+    const max = num(env, 'OWNER_NOTIFY_QUEUE', 50, 0, 200);
+    const limit = num(env, 'OWNER_NOTIFY_TRIES', 5, 1, 50);
+    const back = [];
+    let dropped = 0;
+    for (const it of (Array.isArray(items) ? items : [])) {
+      if (!it) continue;
+      const text = String(it.text || (typeof it === 'string' ? it : '')).slice(0, 1200);
+      if (!text) continue;
+      const tries = Number(it.tries || 0) + 1;
+      if (tries > limit) { dropped++; continue; }
+      back.push({ text, at: Number(it.at) || Date.now(), tries });
+    }
+    if (!back.length) return { queued: 0, dropped };
+    if (!max) return { queued: 0, dropped: dropped + back.length };
+    const cur = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:queue', []), []) || [];
+    const merged = back.concat(Array.isArray(cur) ? cur : []).slice(-max);
+    await QV.safeAsync(() => QV.d1.Kv.set(env, 'qv:owner:queue', merged, 86400 * 30), null);
+    return { queued: merged.length, dropped };
+  };
+  const queueLen = async (env) => {
+    const list = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:queue', []), []) || [];
+    return Array.isArray(list) ? list.length : 0;
+  };
 
   /* ── invite / claim / manage ──────────────────────────────────────────── */
   const deepLink = async (env, code) => {
@@ -401,7 +429,7 @@
     /* lifecycle */
     invite, redeem, add, remove, rotate, sync, deepLink,
     /* notification plumbing (used by the telegram module) */
-    queueAlert, drainQueue,
+    queueAlert, drainQueue, requeueAlerts, queueLen,
     KEYS: { claim: 'qv:owner:claim:', used: 'qv:owner:claim:used:' },
   };
 })();

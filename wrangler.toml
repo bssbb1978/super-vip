@@ -64,6 +64,8 @@ CLEAN_IP_CANDIDATES = ""        # optional extra CIDR list for the endpoint engi
 OWNER_CLAIM_TTL_MIN = "30"      # how long a minted code stays valid (1–1440)
 OWNER_MAX_ADMINS = "8"          # hard cap on non-viewer rows in qv_admins
 OWNER_NOTIFY_QUEUE = "50"       # alerts parked in D1 while nobody is bound yet
+OWNER_NOTIFY_TRIES = "5"        # delivery attempts per parked alert before it is
+                                # dropped (the `owner-alerts` cron task retries)
 OWNER_LOCK = "0"                # 1 = refuse all claiming (env id only)
 # OWNER_PEPPER = ""             # optional: pin the HMAC pepper for codes and
                                 # id fingerprints.  Left empty it is derived from

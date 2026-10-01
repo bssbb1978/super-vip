@@ -12,7 +12,7 @@
  *   · nothing that leaves the worker contains a raw chat id
  * ═══════════════════════════════════════════════════════════════════════════ */
 import { describe, test, expect, beforeAll, afterAll } from 'vitest';
-import { boot, TG_SECRET } from './helpers.mjs';
+import { boot, sleep, TG_SECRET } from './helpers.mjs';
 
 /* deliberately NO ADMIN_TELEGRAM_ID anywhere in this suite */
 let qv, db;
@@ -239,7 +239,19 @@ describe('owner binding: the bot works with no ADMIN_TELEGRAM_ID', () => {
         { 'x-telegram-bot-api-secret-token': TG_SECRET });
       const after = (await fresh.json('/api/owner', { headers: fresh.auth() })).data;
       expect(after.claimed).toBe(true);
-      expect(after.queued_alerts).toBe(0);           // drained
+      /* the hand-over is an *attempt*, and an attempt is observable in both
+         directions: online the queue ends up empty, offline (CI sandboxes with
+         no route to api.telegram.org) the item comes back with tries>=1 rather
+         than being discarded — draining is never treated as acknowledgement */
+      await sleep(1500);           // the hand-over runs in ctx.waitUntil
+      const left = (await freshDb.prepare("SELECT value FROM qv_kv WHERE key = 'qv:owner:queue'").all()).results;
+      if (left.length) {
+        const items = JSON.parse(left[0].value);
+        expect(items.every(i => Number(i.tries) >= 1)).toBe(true);
+        expect(items.some(i => String(i.text).includes('early alert'))).toBe(true);
+      } else {
+        expect(after.queued_alerts).toBe(0);           // delivered
+      }
     } finally { await fresh.dispose(); }
   }, 90000);
 
@@ -322,4 +334,91 @@ describe('owner binding: the bot works with no ADMIN_TELEGRAM_ID', () => {
     }
     expect(anon).not.toMatch(/•{2,}\d{4}/);          // no masked id either
   });
+
+  /* ── the queue must survive every path that binds an owner ────────────────
+     /claim is only one of them: an operator can also add an admin by id from
+     the console, or drop ADMIN_TELEGRAM_ID into the secrets later.  Neither of
+     those passes through Telegram, so the cron task `owner-alerts` is what
+     guarantees the early alerts still arrive. */
+  test('an owner that appears out-of-band is still served by the cron safety net', async () => {
+    const fresh = await boot({ TELEGRAM_BOT_TOKEN: '123456:TEST-TOKEN' });
+    try {
+      const freshDb = await fresh.mf.getD1Database('DB');
+      const queue = async () => {
+        const rows = (await freshDb.prepare("SELECT value FROM qv_kv WHERE key = 'qv:owner:queue'").all()).results;
+        return rows.length ? JSON.parse(rows[0].value) : [];
+      };
+      const flush = async () => (await (await fresh.post('/api/cron', { only: 'owner-alerts', force: true }, fresh.auth())).json())
+        .data.results['owner-alerts'].result;
+
+      await fresh.post('/api/tg', { action: 'notify', text: 'pre-binding alert' }, fresh.auth());
+      expect((await queue()).length).toBe(1);
+
+      /* while nobody can receive, a cron tick must leave the queue untouched */
+      expect((await flush()).skipped).toBe('no-owner');
+      expect((await queue()).length).toBe(1);
+
+      /* an owner row that appears without /claim and without the API — a backup
+         restore, a second admin, ADMIN_TELEGRAM_ID added to the secrets later —
+         is exactly the case the cron task exists for */
+      await freshDb.prepare(`INSERT INTO qv_admins (telegram_id, name, role) VALUES ('808080808','itest','owner')`).run();
+
+      const out = await flush();
+      expect(out.drained).toBe(1);
+      /* reaching api.telegram.org is not something a test can assume: online the
+         queue empties, offline the item comes back with an attempt counter.
+         What must never happen is the alert disappearing untried. */
+      const left = await queue();
+      expect(left.length === 0 || left.every(i => Number(i.tries) >= 1)).toBe(true);
+      expect(out.flushed + out.requeued).toBe(1);
+    } finally { await fresh.dispose(); }
+  }, 90000);
+
+  test('binding an admin from the console flushes the queue without waiting for cron', async () => {
+    const fresh = await boot({ TELEGRAM_BOT_TOKEN: '123456:TEST-TOKEN' });
+    try {
+      const freshDb = await fresh.mf.getD1Database('DB');
+      const queue = async () => {
+        const rows = (await freshDb.prepare("SELECT value FROM qv_kv WHERE key = 'qv:owner:queue'").all()).results;
+        return rows.length ? JSON.parse(rows[0].value) : [];
+      };
+      await fresh.post('/api/tg', { action: 'notify', text: 'waiting alert' }, fresh.auth());
+      expect((await queue()).every(i => i.tries === undefined)).toBe(true);   // untouched
+
+      const add = await (await fresh.post('/api/owner',
+        { action: 'add', telegram_id: '818181818', role: 'owner' }, fresh.auth())).json();
+      expect(add.data.ok).toBe(true);
+      await sleep(2500);                    // the flush runs in ctx.waitUntil
+
+      /* delivered (queue empty) or attempted-and-returned (tries>=1) — an item
+         still sitting there with no counter would mean the flush never ran */
+      const left = await queue();
+      expect(left.length === 0 || left.every(i => Number(i.tries) >= 1)).toBe(true);
+    } finally { await fresh.dispose(); }
+  }, 90000);
+
+  test('retries are bounded: a doomed alert is dropped, not retried forever', async () => {
+    const fresh = await boot({ TELEGRAM_BOT_TOKEN: '123456:TEST-TOKEN', OWNER_NOTIFY_TRIES: '1' });
+    try {
+      const freshDb = await fresh.mf.getD1Database('DB');
+      const queue = async () => {
+        const rows = (await freshDb.prepare("SELECT value FROM qv_kv WHERE key = 'qv:owner:queue'").all()).results;
+        return rows.length ? JSON.parse(rows[0].value) : [];
+      };
+      const flush = async () => (await (await fresh.post('/api/cron', { only: 'owner-alerts', force: true }, fresh.auth())).json())
+        .data.results['owner-alerts'].result;
+
+      await fresh.post('/api/tg', { action: 'notify', text: 'doomed alert' }, fresh.auth());
+      await freshDb.prepare(`INSERT INTO qv_admins (telegram_id, name, role) VALUES ('909090909','itest','owner')`).run();
+
+      const first = await flush();
+      expect(first.drained).toBe(1);
+      const second = await flush();
+
+      /* one attempt was allowed: either it got through, or the second pass gave
+         up on it — but the queue ends empty and nothing loops forever */
+      expect((await queue()).length).toBe(0);
+      expect(first.flushed + second.flushed + first.dropped + second.dropped).toBeGreaterThan(0);
+    } finally { await fresh.dispose(); }
+  }, 90000);
 });

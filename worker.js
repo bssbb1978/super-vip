@@ -1189,7 +1189,7 @@ QV.emit = (env, kind, severity = 'info', o = {}) => {
     /* owner binding — the bot is claimed from an authenticated session, so no
        ADMIN_TELEGRAM_ID has to be configured by hand (31-owner.js) */
     OWNER_CLAIM_TTL_MIN: '30', OWNER_MAX_ADMINS: '8', OWNER_NOTIFY_QUEUE: '50',
-    OWNER_PEPPER: '', OWNER_LOCK: '0',
+    OWNER_NOTIFY_TRIES: '5', OWNER_PEPPER: '', OWNER_LOCK: '0',
     /* upstreams */
     DoH_UPSTREAMS: 'https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.quad9.net/dns-query,https://doh.opendns.com/dns-query,https://dns.adguard-dns.com/dns-query',
     FALLBACK_UPSTREAM: 'dns.google',
@@ -1447,6 +1447,7 @@ QV.emit = (env, kind, severity = 'info', o = {}) => {
         claimTtlMin: Number(get(env, 'OWNER_CLAIM_TTL_MIN', DEFAULTS.OWNER_CLAIM_TTL_MIN)),
         maxAdmins: Number(get(env, 'OWNER_MAX_ADMINS', DEFAULTS.OWNER_MAX_ADMINS)),
         notifyQueue: Number(get(env, 'OWNER_NOTIFY_QUEUE', DEFAULTS.OWNER_NOTIFY_QUEUE)),
+        notifyTries: Number(get(env, 'OWNER_NOTIFY_TRIES', DEFAULTS.OWNER_NOTIFY_TRIES)),
         lock: bool(env, 'OWNER_LOCK', false),
         pepperConfigured: !!get(env, 'OWNER_PEPPER', ''),
       },
@@ -7546,15 +7547,31 @@ QV.dns = (() => {
 
   const flushQueue = async (env, keyboard) => {
     if (!QV.owner) return { flushed: 0 };
+    /* check the recipient list *before* draining: an owner can be bound from
+       the panel or from a secret that appears later, and until then the queue
+       must stay exactly as it is (this runs from cron every few minutes) */
+    const ids = await recipients(env);
+    if (!ids.length) return { flushed: 0, skipped: 'no-owner' };
     const pending = await QV.owner.drainQueue(env);
-    if (!pending.length) return { flushed: 0 };
-    let flushed = 0;
+    if (!pending.length) return { flushed: 0, drained: 0 };
+    let flushed = 0; const undelivered = [];
     for (const item of pending) {
       const r = await notifyAdmin(env, item.text, keyboard, { via: 'queue' });
-      if (r.ok) flushed += r.sent || 0;
+      if (r.ok) flushed += r.sent || 0; else undelivered.push(item);
       await QV.sleep(45);
     }
-    return { flushed };
+    /* draining is not acknowledgement — put back whatever did not go out */
+    const back = undelivered.length ? await QV.owner.requeueAlerts(env, undelivered) : { queued: 0, dropped: 0 };
+    if (undelivered.length) {
+      QV.emit(env, 'tg:notify', back.dropped ? 'error' : 'warn', {
+        message: `queued alert(s) could not be delivered — requeued (${back.queued} pending` +
+          (back.dropped ? `, ${back.dropped} dropped after too many attempts` : '') + ')',
+      });
+    }
+    return {
+      flushed, drained: pending.length, requeued: undelivered.length,
+      dropped: back.dropped || 0, pending: back.queued || 0,
+    };
   };
 
   const notifyAdmin = async (env, text, keyboard, opts = {}) => {
@@ -8617,6 +8634,34 @@ Otherwise reply with plain text only. Be concise and technical.`;
     if (Array.isArray(list) && list.length) await QV.safeAsync(() => QV.d1.Kv.del(env, 'qv:owner:queue'), null);
     return Array.isArray(list) ? list : [];
   };
+  /** draining is not acknowledgement: an item that could not be handed to
+      Telegram (429, network, an owner removed mid-flush) goes back on the
+      queue, oldest first — but only up to OWNER_NOTIFY_TRIES attempts, so a
+      permanently broken destination cannot pin the queue forever */
+  const requeueAlerts = async (env, items) => {
+    const max = num(env, 'OWNER_NOTIFY_QUEUE', 50, 0, 200);
+    const limit = num(env, 'OWNER_NOTIFY_TRIES', 5, 1, 50);
+    const back = [];
+    let dropped = 0;
+    for (const it of (Array.isArray(items) ? items : [])) {
+      if (!it) continue;
+      const text = String(it.text || (typeof it === 'string' ? it : '')).slice(0, 1200);
+      if (!text) continue;
+      const tries = Number(it.tries || 0) + 1;
+      if (tries > limit) { dropped++; continue; }
+      back.push({ text, at: Number(it.at) || Date.now(), tries });
+    }
+    if (!back.length) return { queued: 0, dropped };
+    if (!max) return { queued: 0, dropped: dropped + back.length };
+    const cur = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:queue', []), []) || [];
+    const merged = back.concat(Array.isArray(cur) ? cur : []).slice(-max);
+    await QV.safeAsync(() => QV.d1.Kv.set(env, 'qv:owner:queue', merged, 86400 * 30), null);
+    return { queued: merged.length, dropped };
+  };
+  const queueLen = async (env) => {
+    const list = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:queue', []), []) || [];
+    return Array.isArray(list) ? list.length : 0;
+  };
 
   /* ── invite / claim / manage ──────────────────────────────────────────── */
   const deepLink = async (env, code) => {
@@ -8794,7 +8839,7 @@ Otherwise reply with plain text only. Be concise and technical.`;
     /* lifecycle */
     invite, redeem, add, remove, rotate, sync, deepLink,
     /* notification plumbing (used by the telegram module) */
-    queueAlert, drainQueue,
+    queueAlert, drainQueue, requeueAlerts, queueLen,
     KEYS: { claim: 'qv:owner:claim:', used: 'qv:owner:claim:used:' },
   };
 })();
@@ -9637,6 +9682,10 @@ p{color:#93a0c4;margin:6px 0}b{color:#5b8cff}.box{margin-top:18px;border:1px sol
     { id: 'ai-refresh', every: 21600, budgetMs: 20000, run: async (env, ctx) => QV.ai.refresh(env, ctx) },
     { id: 'health-probe', every: 1800, budgetMs: 15000, run: async (env, ctx) => QV.ai.probe(env, ctx) },
     { id: 'telegram-poll', every: 120, budgetMs: 8000, run: async (env, ctx) => QV.telegram.pollOnce(env, ctx) },
+    /* alerts parked while the node had no owner go out the moment one exists —
+       including an owner bound from the panel or from a secret added later,
+       which never passes through the Telegram /claim path */
+    { id: 'owner-alerts', every: 300, budgetMs: 8000, run: async (env) => QV.telegram.flushQueue(env) },
     { id: 'metrics-rollup', every: 900, budgetMs: 10000, run: async (env) => QV.metrics.rollup(env) },
     { id: 'jobs-gc', every: 900, budgetMs: 5000, run: async (env) => QV.d1.Jobs.gc(env) },
     { id: 'backup', every: 86400, budgetMs: 25000, run: async (env, ctx) => QV.d1.exportAll(env, { toKv: true, ctx }) },
@@ -10287,7 +10336,16 @@ QV.router = { handleFetch, runUnitSides, scheduled, queue, CRON_TASKS, selfHeal,
           return ok(r);
         }
         if (action === 'rotate') return ok(await QV.owner.rotate(c.env, c.ctx));
-        if (action === 'add') return ok(await QV.owner.add(c.env, c.ctx, b.telegram_id || b.chat_id, b.role || 'admin', b.name || ''));
+        if (action === 'add') {
+          const r = await QV.owner.add(c.env, c.ctx, b.telegram_id || b.chat_id, b.role || 'admin', b.name || '');
+          /* an admin bound by id never passes through Telegram's /claim, so the
+             alerts queued while the node was unclaimed are delivered right now
+             instead of waiting for the owner-alerts cron tick */
+          if (r && r.ok && QV.telegram && QV.telegram.flushQueue && c.ctx && c.ctx.waitUntil) {
+            c.ctx.waitUntil(QV.telegram.flushQueue(c.env).catch(() => {}));
+          }
+          return ok(r);
+        }
         if (action === 'remove') return ok(await QV.owner.remove(c.env, c.ctx, b.telegram_id || b.chat_id || seg[1]));
         if (action === 'status') return ok(await QV.owner.status(c.env));
         return fail('unknown action', 400);

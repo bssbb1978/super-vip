@@ -514,7 +514,16 @@
           return ok(r);
         }
         if (action === 'rotate') return ok(await QV.owner.rotate(c.env, c.ctx));
-        if (action === 'add') return ok(await QV.owner.add(c.env, c.ctx, b.telegram_id || b.chat_id, b.role || 'admin', b.name || ''));
+        if (action === 'add') {
+          const r = await QV.owner.add(c.env, c.ctx, b.telegram_id || b.chat_id, b.role || 'admin', b.name || '');
+          /* an admin bound by id never passes through Telegram's /claim, so the
+             alerts queued while the node was unclaimed are delivered right now
+             instead of waiting for the owner-alerts cron tick */
+          if (r && r.ok && QV.telegram && QV.telegram.flushQueue && c.ctx && c.ctx.waitUntil) {
+            c.ctx.waitUntil(QV.telegram.flushQueue(c.env).catch(() => {}));
+          }
+          return ok(r);
+        }
         if (action === 'remove') return ok(await QV.owner.remove(c.env, c.ctx, b.telegram_id || b.chat_id || seg[1]));
         if (action === 'status') return ok(await QV.owner.status(c.env));
         return fail('unknown action', 400);

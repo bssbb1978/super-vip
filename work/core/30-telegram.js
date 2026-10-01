@@ -74,15 +74,31 @@
 
   const flushQueue = async (env, keyboard) => {
     if (!QV.owner) return { flushed: 0 };
+    /* check the recipient list *before* draining: an owner can be bound from
+       the panel or from a secret that appears later, and until then the queue
+       must stay exactly as it is (this runs from cron every few minutes) */
+    const ids = await recipients(env);
+    if (!ids.length) return { flushed: 0, skipped: 'no-owner' };
     const pending = await QV.owner.drainQueue(env);
-    if (!pending.length) return { flushed: 0 };
-    let flushed = 0;
+    if (!pending.length) return { flushed: 0, drained: 0 };
+    let flushed = 0; const undelivered = [];
     for (const item of pending) {
       const r = await notifyAdmin(env, item.text, keyboard, { via: 'queue' });
-      if (r.ok) flushed += r.sent || 0;
+      if (r.ok) flushed += r.sent || 0; else undelivered.push(item);
       await QV.sleep(45);
     }
-    return { flushed };
+    /* draining is not acknowledgement — put back whatever did not go out */
+    const back = undelivered.length ? await QV.owner.requeueAlerts(env, undelivered) : { queued: 0, dropped: 0 };
+    if (undelivered.length) {
+      QV.emit(env, 'tg:notify', back.dropped ? 'error' : 'warn', {
+        message: `queued alert(s) could not be delivered — requeued (${back.queued} pending` +
+          (back.dropped ? `, ${back.dropped} dropped after too many attempts` : '') + ')',
+      });
+    }
+    return {
+      flushed, drained: pending.length, requeued: undelivered.length,
+      dropped: back.dropped || 0, pending: back.queued || 0,
+    };
   };
 
   const notifyAdmin = async (env, text, keyboard, opts = {}) => {

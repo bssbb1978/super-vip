@@ -29,7 +29,7 @@
     /* owner binding — the bot is claimed from an authenticated session, so no
        ADMIN_TELEGRAM_ID has to be configured by hand (31-owner.js) */
     OWNER_CLAIM_TTL_MIN: '30', OWNER_MAX_ADMINS: '8', OWNER_NOTIFY_QUEUE: '50',
-    OWNER_PEPPER: '', OWNER_LOCK: '0',
+    OWNER_NOTIFY_TRIES: '5', OWNER_PEPPER: '', OWNER_LOCK: '0',
     /* upstreams */
     DoH_UPSTREAMS: 'https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.quad9.net/dns-query,https://doh.opendns.com/dns-query,https://dns.adguard-dns.com/dns-query',
     FALLBACK_UPSTREAM: 'dns.google',
@@ -287,6 +287,7 @@
         claimTtlMin: Number(get(env, 'OWNER_CLAIM_TTL_MIN', DEFAULTS.OWNER_CLAIM_TTL_MIN)),
         maxAdmins: Number(get(env, 'OWNER_MAX_ADMINS', DEFAULTS.OWNER_MAX_ADMINS)),
         notifyQueue: Number(get(env, 'OWNER_NOTIFY_QUEUE', DEFAULTS.OWNER_NOTIFY_QUEUE)),
+        notifyTries: Number(get(env, 'OWNER_NOTIFY_TRIES', DEFAULTS.OWNER_NOTIFY_TRIES)),
         lock: bool(env, 'OWNER_LOCK', false),
         pepperConfigured: !!get(env, 'OWNER_PEPPER', ''),
       },
