@@ -1,0 +1,224 @@
+name: Build, Obfuscate & Deploy
+
+# ──────────────────────────────────────────────────────────────────────────
+# What changed vs. the old workflow, and why:
+#
+# 1. The old job obfuscated "index.js", which doesn't exist in this repo
+#    (the entry point is worker.js). Fixed.
+# 2. The old job committed the obfuscated file back to `main` while also
+#    triggering on `**/*.js` pushes — that's a direct infinite-loop: every
+#    bot commit re-triggers itself. Fixed by never committing build output
+#    back to the repo; the obfuscated bundle is produced, tested, uploaded
+#    as a run artifact, and deployed straight from the job — nothing is lost,
+#    it just isn't round-tripped through git.
+# 3. The old job ran `git push` on `pull_request` too, which fails for any
+#    PR from a fork (no write token) and would also push to an arbitrary
+#    PR head. Deploy now only runs on `push` to main / manual dispatch;
+#    pull requests only get build + test, so a PR can't accidentally deploy.
+# 4. There was no actual "deploy" step anywhere — only obfuscate + commit.
+#    Added a real `wrangler deploy` stage wired to GitHub Actions secrets
+#    and variables, plus idempotent D1/KV provisioning and a secret sync
+#    step, so a push to main can go from source to a live Worker.
+# 5. Obfuscation is upgraded from the "gentle" preset to a stronger one,
+#    but two aggressive javascript-obfuscator features are deliberately
+#    kept OFF: `self-defending` and `debug-protection`. Both inject
+#    integrity/anti-debugging loops that assume a browser devtools context;
+#    in the Workers isolate they are known to throw on invocation ("Code
+#    generation from strings disallowed" / disallowed global-scope timers)
+#    or simply deadlock. Turning them on would look "stronger" but would
+#    break the deploy. Everything else is turned up. `--reserved-names`
+#    pins the two identifiers external bindings depend on by literal string
+#    (`QVRelay`, the Durable Object class name wrangler.toml binds to, and
+#    `__QV_HANDLER`), so renaming never breaks the binding.
+#
+# Honesty note (matches the project's own house style of calling out
+# assumptions): "fully automatic, never errors" isn't a real guarantee for
+# a pipeline that talks to an external API (Cloudflare) over the network —
+# tokens expire, rate limits happen, accounts hit plan limits. What this
+# workflow *does* guarantee is that it fails loudly with a specific message
+# instead of silently deploying something broken, and that nothing deploys
+# unless the obfuscated bundle both parses and passes the existing test
+# suite against a real miniflare-emulated Worker.
+# ──────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'work/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: 'Target environment'
+        type: choice
+        options: [production, staging]
+        default: production
+      provision:
+        description: 'Create the D1 database / KV namespace if missing (safe to leave off once set up)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── build + obfuscate + test — runs on every push and every PR ──────────
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install javascript-obfuscator
+        run: npm install --no-save javascript-obfuscator@^4
+
+      - name: Embed build metadata (before obfuscation, not after)
+        # Doing this *before* obfuscation means the version comment is part
+        # of what gets parsed/transformed as a unit, instead of being spliced
+        # into an already-obfuscated file (which is what the old step did,
+        # and which breaks any integrity/self-check obfuscator feature).
+        run: |
+          set -euo pipefail
+          VERSION_LINE="// build ${GITHUB_SHA} - $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+          { printf '%s\n' "$VERSION_LINE"; cat worker.js; } > worker.versioned.js
+
+      - name: Obfuscate (strong preset, Workers-safe)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          npx javascript-obfuscator worker.versioned.js --output dist/worker.js \
+            --compact true \
+            --control-flow-flattening true \
+            --control-flow-flattening-threshold 0.4 \
+            --dead-code-injection true \
+            --dead-code-injection-threshold 0.2 \
+            --identifier-names-generator mangled \
+            --rename-globals false \
+            --string-array true \
+            --string-array-encoding base64 \
+            --string-array-threshold 0.75 \
+            --string-array-rotate true \
+            --string-array-shuffle true \
+            --split-strings true \
+            --split-strings-chunk-length 10 \
+            --transform-object-keys true \
+            --numbers-to-expressions true \
+            --simplify true \
+            --unicode-escape-sequence false \
+            --self-defending false \
+            --debug-protection false \
+            --disable-console-output false \
+            --reserved-names "^QVRelay$,^__QV_HANDLER$,^onRequest" \
+            --target browser
+
+      - name: Validate the obfuscated bundle actually parses as a module
+        run: |
+          set -euo pipefail
+          cp dist/worker.js /tmp/worker.check.mjs
+          node --check /tmp/worker.check.mjs
+          echo "Bundle size: $(du -h dist/worker.js | cut -f1)"
+
+      - name: Run the existing test suite against the obfuscated bundle
+        # This is the real safety gate: if obfuscation subtly broke a code
+        # path (the Durable Object export, Shadowsocks framing, DNS, etc.)
+        # the suite boots the *obfuscated* file in a real miniflare
+        # (D1 + KV) isolate, exactly like tests/helpers.mjs already does for
+        # the plain build — so a break here fails the job before deploy ever
+        # runs, instead of failing silently in production.
+        working-directory: work
+        env:
+          QV_SCRIPT: ${{ github.workspace }}/dist/worker.js
+        run: |
+          set -euo pipefail
+          npm ci
+          npx vitest run
+
+      - name: Upload obfuscated bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-obfuscated-${{ github.sha }}
+          path: dist/worker.js
+          retention-days: 30
+
+  # ── deploy — only on push to main or manual dispatch, never on a PR ─────
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    environment: ${{ github.event.inputs.deploy_env || 'production' }}
+    env:
+      DEPLOY_ENV: ${{ github.event.inputs.deploy_env || 'production' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: worker-obfuscated-${{ github.sha }}
+          path: dist
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check required Cloudflare credentials are present
+        run: |
+          set -euo pipefail
+          miss=()
+          [ -z "${CLOUDFLARE_API_TOKEN:-}" ] && miss+=("CLOUDFLARE_API_TOKEN")
+          [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ] && miss+=("CLOUDFLARE_ACCOUNT_ID")
+          if [ "${#miss[@]}" -gt 0 ]; then
+            echo "::error::Missing repository secrets: ${miss[*]}. Add them under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: Install wrangler
+        run: npm install --no-save wrangler@^4
+
+      - name: Apply non-secret configuration from repository variables
+        env:
+          CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
+          HOSTS: ${{ vars.HOSTS }}
+          DEFAULT_QUOTA_GB: ${{ vars.DEFAULT_QUOTA_GB }}
+          WORKER_NAME: ${{ vars.WORKER_NAME }}
+        run: bash scripts/patch-wrangler-vars.sh
+
+      - name: Provision D1 database + KV namespace (idempotent)
+        if: ${{ github.event.inputs.provision == 'true' }}
+        run: bash scripts/provision.sh
+
+      - name: Sync secrets to the Worker
+        env:
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          API_SECRET_TOKEN: ${{ secrets.API_SECRET_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ADMIN_TELEGRAM_ID: ${{ secrets.ADMIN_TELEGRAM_ID }}
+          SS_MASTER_SECRET: ${{ secrets.SS_MASTER_SECRET }}
+          BRIDGE_SECRET: ${{ secrets.BRIDGE_SECRET }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          SS_PASSWORD: ${{ secrets.SS_PASSWORD }}
+        run: bash scripts/push-secrets.sh
+
+      - name: Deploy to Cloudflare Workers
+        run: |
+          set -euo pipefail
+          FLAG=""
+          [ "$DEPLOY_ENV" = "staging" ] && FLAG="--env staging"
+          npx wrangler deploy dist/worker.js $FLAG
+
+      - name: Post-deploy health check
+        env:
+          CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
+        run: bash scripts/health-check.sh

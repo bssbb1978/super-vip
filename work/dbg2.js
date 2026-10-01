@@ -1,0 +1,20 @@
+const { Miniflare, Log, LogLevel } = require('miniflare');
+(async () => {
+  const mf = new Miniflare({ modules: true, scriptPath: 'dist/core-only.js', compatibilityDate: '2025-01-01', compatibilityFlags: ['nodejs_compat'], d1Databases: { DB: 'd' }, kvNamespaces: { KV: 'k' }, bindings: { ADMIN_PASSWORD: 'p', DOMAIN: 'e.example' }, log: new Log(LogLevel.ERROR) });
+  const t = (await (await mf.dispatchFetch('http://x/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'p' }) })).json()).token;
+  const H = { 'x-api-token': t, 'content-type': 'application/json' };
+  const st = await (await mf.dispatchFetch('http://x/api/selftest', { headers: H })).json();
+  for (const r of st.selfcheck.results.filter(r => r.status === 'fail')) console.log('FAIL', r.group + '/' + r.name, '→', r.detail);
+  console.log('\n-- dns --');
+  const dj = await mf.dispatchFetch('http://x/dns/json?name=cloudflare.com');
+  console.log('status', dj.status, (await dj.text()).slice(0, 300));
+  console.log('\n-- kill --');
+  await mf.dispatchFetch('http://x/api/users', { method: 'POST', headers: H, body: JSON.stringify({ uuid: 'kk', quotaGb: 5 }) });
+  const k = await (await mf.dispatchFetch('http://x/api/users/kk', { method: 'PATCH', headers: H, body: JSON.stringify({ kill: true }) })).json();
+  console.log('patch →', JSON.stringify(k.user && { enabled: k.user.enabled, kill: k.user.killswitch }));
+  const sub = await mf.dispatchFetch('http://x/sub/kk');
+  console.log('sub status', sub.status);
+  console.log('\n-- miniflare api --');
+  console.log(Object.getOwnPropertyNames(Object.getPrototypeOf(mf)).join(' '));
+  await mf.dispose();
+})();

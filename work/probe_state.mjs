@@ -1,0 +1,15 @@
+import { boot } from './tests/helpers.mjs';
+const qv = await boot();
+const A = qv.auth();
+const u = await qv.createUser({ name: 'state-probe', quota_bytes: 2000, days: 5 });
+const sub = async () => (await qv.get('/sub/' + u.uuid)).status;
+console.log('fresh sub      ', await sub());
+await qv.post('/api/meter', { uuid: u.uuid, up: 5000, down: 0 }, A);
+console.log('after overrun  ', await sub(), '| row killswitch:', (await qv.json('/api/users/' + u.uuid, { headers: A })).data.item.killswitch);
+const p = await qv.patch('/api/users/' + u.uuid, { killswitch: 0, enabled: 1, used_bytes: 0 }, A);
+const pj = await p.json();
+console.log('patch status   ', p.status, '| row now:', JSON.stringify({ ks: pj.data.item.killswitch, used: pj.data.item.used_bytes, en: pj.data.item.enabled }));
+console.log('after revive   ', await sub());
+await new Promise(r => setTimeout(r, 8000));
+console.log('after 8s       ', await sub());
+await qv.dispose();

@@ -1,0 +1,13 @@
+import { boot } from './tests/helpers.mjs';
+const qv = await boot();
+const c = async () => (await qv.json('/health')).data.counters;
+const u = await qv.createUser({ name: 'kv-probe', quota_gb: 2 });
+const A = qv.auth();
+const step = async (label, fn) => { const b = await c(); await fn(); const a = await c(); console.log(label.padEnd(24), 'kv_write +' + ((a.kv_write || 0) - (b.kv_write || 0)), 'd1_write +' + ((a.d1_write || 0) - (b.d1_write || 0)), 'd1_read +' + ((a.d1_read || 0) - (b.d1_read || 0))); };
+await step('createUser', async () => {});
+await step('/sub (cold)', () => qv.get('/sub/' + u.uuid));
+await step('/sub (warm x3)', async () => { for (let i = 0; i < 3; i++) await qv.get('/sub/' + u.uuid); });
+await step('/api/meter x3', async () => { for (let i = 0; i < 3; i++) await qv.post('/api/meter', { uuid: u.uuid, up: 100, down: 200 }, A); });
+await step('/api/users/:id', () => qv.json('/api/users/' + u.uuid, { headers: A }));
+await step('/api/cron quota-sweep', () => qv.post('/api/cron', { only: 'quota-sweep', force: true }, A));
+await qv.dispose();

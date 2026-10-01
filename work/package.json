@@ -1,0 +1,20 @@
+{
+  "name": "work",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "acorn": "^8.18.0",
+    "acorn-loose": "^8.5.2",
+    "acorn-walk": "^8.3.5",
+    "esbuild": "^0.28.2",
+    "miniflare": "^4.20260426.0",
+    "vitest": "^2.1.9"
+  }
+}

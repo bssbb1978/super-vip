@@ -1,0 +1,16 @@
+import { boot } from './tests/helpers.mjs';
+const qv = await boot({ __D1_TRACE__: '1' });
+const A = qv.auth();
+const u = await qv.createUser({ name: 'cron-probe', quota_bytes: 1000, days: 5 });
+console.log('created', u.uuid, 'total', u.total_bytes);
+const p = await qv.patch('/api/users/' + u.uuid, { used_bytes: 5000 }, A);
+const pj = await p.json();
+console.log('patch status', p.status, 'used now', (pj.data.item || {}).used_bytes);
+const r = await qv.post('/api/cron', { only: 'quota-sweep' }, A);
+const rj = await r.json();
+console.log('cron', r.status, JSON.stringify(rj.data).slice(0, 300));
+const row = (await qv.json('/api/users/' + u.uuid, { headers: A })).data.item;
+console.log('after sweep', JSON.stringify({ enabled: row.enabled, killswitch: row.killswitch, used: row.used_bytes }));
+const s = await qv.get('/sub/' + u.uuid);
+console.log('sub after sweep', s.status);
+await qv.dispose();

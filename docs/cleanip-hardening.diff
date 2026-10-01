@@ -1,0 +1,673 @@
+# clean-endpoint engine — hardening pass · verified unified diff
+# generated with diff -u against the tree as it stood at the start of the audit
+# files: core/22-cleanip.js, 10-antidpi.js, 12-d1ext.js, 40-router.js, 42-api.js, 19-legacy-shims.js
+--- a/core/22-cleanip.js
++++ b/core/22-cleanip.js
+@@ -171,8 +171,11 @@
+     if (o.length !== 4) return null;
+     let v = 0;
+     for (const part of o) {
++      /* canonical octets only: "010.0.0.1" and " 1" must never become a second
++         key for the same address in qv_ip_scores (PK is (scope, ip)). */
++      if (!/^(?:0|[1-9][0-9]{0,2})$/.test(part)) return null;
+       const n = Number(part);
+-      if (!Number.isInteger(n) || n < 0 || n > 255) return null;
++      if (n > 255) return null;
+       v = (v * 256) + n;
+     }
+     return v >>> 0;
+@@ -252,13 +255,32 @@
+     }
+     return true;
+   };
+-  const isExcluded = (ip) => {
++  /* the two NAT64 well-known prefixes are excluded from *sampling* (we do not
++     probe them) but they are legitimate *outputs* of the DNS64 mapping when an
++     IPv4-only endpoint is handed to an IPv6-only subscriber — so the exclusion
++     is opt-out for exactly those two, and only where a mapping is expected. */
++  const NAT64_ALLOW = new Set(['64:ff9b::/96', '64:ff9b:1::/48']);
++  const isExcluded = (ip, opts = {}) => {
+     const list = isV6(ip) ? EXCLUDE_V6 : EXCLUDE_V4;
+-    for (const c of list) if (inCidr(ip, c)) return true;
++    for (const c of list) { if (opts.nat64 && NAT64_ALLOW.has(c)) continue; if (inCidr(ip, c)) return true; }
+     return false;
+   };
+-  /** an address we are willing to hand to a subscriber (and to probe) */
+-  const isUsable = (ip) => !!ip && !isExcluded(ip) && (isV6(ip) ? v6ToBytes(ip) !== null : v4ToInt(ip) !== null);
++  /** the canonical text form is the row identity in qv_ip_scores: one address,
++   *  one row, whatever spelling a client or a provider used. */
++  const canonIp = (ip) => {
++    const s = String(ip == null ? '' : ip).trim().toLowerCase();
++    if (!s) return null;
++    if (s.includes(':')) { const b = v6ToBytes(s); return b ? bytesToV6(b) : null; }
++    const v = v4ToInt(s);
++    return v === null ? null : intToV4(v);
++  };
++  /** an address we are willing to hand to a subscriber (and to probe).
++   *  opts.nat64 = accept a 64:ff9b::/96 mapping produced by our own DNS64. */
++  const isUsable = (ip, opts = {}) => {
++    const c = canonIp(ip);
++    if (!c) return false;
++    return !isExcluded(c, opts);
++  };
+ 
+   /* stratified sampling: one random host per distinct /24 (v4) or /48 (v6)
+    * stratum, so a handful of draws covers the whole range instead of
+@@ -297,6 +319,38 @@
+   /* ─────────────────────── provider range discovery ────────────────────── */
+   const RANGE_CACHE = QV.cache('ciRanges', { max: 32, maxBytes: 512 * 1024, ttl: 6 * HOUR * 1000 });
+ 
++  const cidrContains = (outer, inner) => {
++    const a = typeof outer === 'string' ? parseCidr(outer) : outer;
++    const b = typeof inner === 'string' ? parseCidr(inner) : inner;
++    if (!a || !b || a.family !== b.family || a.bits > b.bits) return false;
++    return inCidr(b.family === 'v4' ? intToV4(b.int) : bytesToV6(b.bytes), a);
++  };
++
++  /**
++   * Validation for anything a third party hands us (the live provider lists and
++   * the RIPE Stat announcements).  A range becomes a candidate only if it is a
++   * well-formed CIDR of the right family, no wider than a sane announcement,
++   * entirely outside reserved/bogon space, and not already covered by a wider
++   * prefix that we kept — nested announcements would otherwise make the
++   * sampler draw the same scarce stratum twice.
++   */
++  const MIN_BITS = { v4: 8, v6: 16 };
++  const validateRanges = (list, family) => {
++    const kept = [];
++    for (const raw of list || []) {
++      if (typeof raw !== 'string') continue;
++      const c = parseCidr(raw);
++      if (!c || c.family !== family) continue;
++      if (c.bits < MIN_BITS[family]) continue;                       /* /0 … /7 v4, /0 … /15 v6 */
++      const base = family === 'v4' ? intToV4(c.int) : bytesToV6(c.bytes);
++      if (!base || isExcluded(base)) continue;                        /* bogons never become candidates */
++      if (!kept.some(k => cidrContains(k, raw))) kept.push(raw.trim().toLowerCase());
++      if (kept.length >= 512) break;
++    }
++    return kept;
++  };
++
++  /* kept as the historical helper name used by the parsers below */
+   const parseLive = (provider, body) => {
+     const out = { v4: [], v6: [] };
+     try {
+@@ -322,8 +376,8 @@
+     /* a provider may announce thousands of prefixes (Akamai alone is ~4 000).
+        The engine keeps a bounded sample: the ranking only ever hands out a few
+        dozen addresses, and an unbounded list would be a memory liability.     */
+-    const clean = (list) => [...new Set((list || []).filter(x => typeof x === 'string' && parseCidr(x)))].slice(0, 400);
+-    return { v4: clean(out.v4), v6: clean(out.v6) };
++    const clean = (list) => validateRanges(list, (list && list.length && String(list[0]).includes(':')) ? 'v6' : 'v4').slice(0, 400);
++    return { v4: validateRanges(out.v4, 'v4'), v6: validateRanges(out.v6, 'v6') };
+   };
+ 
+   /** every provider's ranges, live when possible, static otherwise */
+@@ -334,11 +388,15 @@
+     for (const p of PROVIDERS) {
+       let lists = null;
+       if (opts.refresh) {
+-        const body = await QV.safeAsync(() => QV.fetchWithRetry(p.rangesUrl, {}, { retries: 1, timeoutMs: 6000, init: { headers: { 'user-agent': 'qv-endpoint-engine' } } }), null);
++        const body = await QV.safeAsync(() => QV.fetchWithRetry(p.rangesUrl,
++          { headers: { 'user-agent': 'qv-endpoint-engine' } },
++          { retries: 1, timeoutMs: 6000 }), null);
+         if (body && body.ok) lists = parseLive(p, await QV.safeAsync(() => body.json(), null) || {});
+       }
+       const live = lists && (lists.v4.length || lists.v6.length);
+-      const chosen = live ? lists : { v4: p.v4, v6: p.v6 };
++      /* the static fallback goes through the same validator as a live list:
++         a typo in a curated range must be caught here, not by a subscriber */
++      const chosen = live ? lists : { v4: validateRanges(p.v4, 'v4'), v6: validateRanges(p.v6, 'v6') };
+       out.providers.push({
+         id: p.id, name: p.name, asn: p.asn, usable_as: p.usable_as, why: p.why,
+         source: live ? 'live' : 'static-fallback', v4: chosen.v4.length, v6: chosen.v6.length,
+@@ -454,11 +512,23 @@
+     const s = QV.env.get(env, 'JWT_SECRET', '') || QV.env.get(env, 'API_SECRET_TOKEN', '') || 'qv-batch';
+     return String(s);
+   };
++  /**
++   * A batch token is self-describing on purpose.  The allow-list of addresses
++   * and handles travels *inside* the HMAC-signed payload, so any isolate —
++   * not just the one that issued it — can verify that a report is about
++   * something we actually handed out.  Without this, a signed token replayed
++   * to another colo met an empty in-isolate cache and was accepted blindly.
++   * Size is bounded (≤ 10 addresses + ≤ 3 handles ≈ 700 B) and enforced again
++   * on verify.
++   */
+   const makeBatch = async (env, uuid, opts = {}) => {
++    const ips = [...new Set((opts.ips || []).map(canonIp).filter(Boolean))].slice(0, LIMITS.batchIps);
++    const hosts = [...new Set((opts.hosts || []).map(h => String(h).trim().toLowerCase()).filter(Boolean))].slice(0, LIMITS.batchHosts);
+     const b = {
+       u: uuid, b: QV.shortId(8), e: Math.floor(Date.now() / 1000) + 600,
+       n: opts.nonce || QV.hex(QV.rand(6)),
+       j: opts.jitter ? 1 : 0,
++      i: ips, h: hosts,
+     };
+     const payload = batchPayload(b);
+     return { token: payload + '.' + (await signBatch(env, payload)), batch: b };
+@@ -466,6 +536,7 @@
+   const verifyBatch = async (env, token, uuid) => {
+     const parts = String(token || '').split('.');
+     if (parts.length !== 2) return { ok: false, error: 'malformed' };
++    if (parts[0].length > 2048 || parts[1].length > 128) return { ok: false, error: 'too-large' };
+     const expect = await signBatch(env, parts[0]);
+     if (!QV.timingSafeEqual(expect, parts[1])) return { ok: false, error: 'bad-signature' };
+     let b;
+@@ -473,6 +544,9 @@
+     if (!b || typeof b !== 'object') return { ok: false, error: 'bad-payload' };
+     if (uuid && b.u !== uuid) return { ok: false, error: 'wrong-account' };
+     if (!b.e || b.e * 1000 < Date.now()) return { ok: false, error: 'expired' };
++    b.i = [...new Set((Array.isArray(b.i) ? b.i : []).map(canonIp).filter(Boolean))].slice(0, LIMITS.batchIps);
++    b.h = [...new Set((Array.isArray(b.h) ? b.h : []).map(h => String(h).trim().toLowerCase()).filter(Boolean))].slice(0, LIMITS.batchHosts);
++    if (!b.i.length && !b.h.length) return { ok: false, error: 'batch-without-targets' };
+     return { ok: true, batch: b };
+   };
+ 
+@@ -485,6 +559,17 @@
+   const RATE = QV.cache('ciRate', { max: 4000, maxBytes: 512 * 1024, ttl: HOUR * 1000 });
+   const HANDOUT = QV.cache('ciHandout', { max: 5000, maxBytes: 2 * 1024 * 1024, ttl: 15 * 60 * 1000 });
+ 
++  /* one tunnel-feedback sample per (account, target) per hour: an account that
++     reconnects in a loop must not be able to inflate a host's score */
++  const FB_GUARD = QV.cache('ciFb', { max: 4000, maxBytes: 256 * 1024, ttl: HOUR * 1000 });
++  const KNOWN = QV.cache('ciKnown', { max: 64, maxBytes: 256 * 1024, ttl: 60 * 1000 });
++  const fbOnce = (uuid, key) => {
++    const k = 'f:' + String(uuid || '-') + ':' + key;
++    if (FB_GUARD.get(k)) return false;
++    FB_GUARD.set(k, 1, HOUR * 1000);
++    return true;
++  };
++
+   const rateOk = (uuid) => {
+     const k = 'r:' + uuid;
+     const n = RATE.get(k) || 0;
+@@ -505,7 +590,7 @@
+         fails: 0, suspect: 0, country: meta.country || null, at: Date.now() };
+       REPORT_BUF.set(key, agg);
+     }
+-    const weight = entry.suspect ? 0.25 : 1;
++    const weight = entry.suspect ? 0.25 : (Number.isFinite(entry.weight) && entry.weight > 0 ? Math.min(1, entry.weight) : 1);
+     agg.samples += weight;
+     if (entry.ok) { agg.ok += weight; agg.last_ok = Date.now(); } else agg.fails += 1;
+     if (entry.tlsOk) agg.tls_ok += weight;
+@@ -539,7 +624,8 @@
+     const hostReports = Array.isArray(body.h) ? body.h.slice(0, LIMITS.batchHosts) : [];
+     if (!reports.length && !hostReports.length) return { ok: false, error: 'empty', status: 400 };
+     if (reports.length > LIMITS.reportsPerBatch) return { ok: false, error: 'too-many-reports', status: 400 };
+-    const handout = HANDOUT.get(verdict.batch.b) || { ips: [], hosts: [], family: null };
++    /* the allow-list comes from the signed token, not from isolate RAM */
++    const handout = { ips: verdict.batch.i || [], hosts: verdict.batch.h || [], family: null };
+     const cf = (request.cf || {});
+     const meta = {
+       asn: cf.asn ? String(cf.asn) : null,
+@@ -548,10 +634,11 @@
+     };
+     let accepted = 0, rejected = 0;
+     for (const r of reports) {
+-      const ip = String(r.ip || '').trim();
+-      if (!isUsable(ip)) { rejected++; continue; }
+-      /* only addresses this account was actually handed may be reported */
+-      if (handout.ips.length && !handout.ips.includes(ip)) { rejected++; continue; }
++      const ip = canonIp(r.ip);
++      if (!ip || !isUsable(ip)) { rejected++; continue; }
++      /* only addresses this account was actually handed may be reported —
++         the list is signed, so this holds on every isolate */
++      if (!handout.ips.includes(ip)) { rejected++; continue; }
+       const nonce = String(r.nonce || '').slice(0, 24);
+       const dupKey = 'd:' + verdict.batch.b + ':' + ip + ':' + nonce;
+       if (BATCH_SEEN.get(dupKey)) { rejected++; continue; }
+@@ -574,8 +661,8 @@
+        pick() can never mistake for an address (isUsable rejects it). */
+     for (const r of hostReports) {
+       const host = String(r.host || '').trim().toLowerCase();
+-      if (!host || host.length > 253 || /[^a-z0-9.\-:]/.test(host)) { rejected++; continue; }
+-      if (handout.hosts.length && !handout.hosts.includes(host)) { rejected++; continue; }
++      if (!host || host.length > 253 || !/^[a-z0-9][a-z0-9.\-]*\.[a-z0-9]{2,}$/.test(host)) { rejected++; continue; }
++      if (!handout.hosts.includes(host)) { rejected++; continue; }
+       const nonce = String(r.nonce || '').slice(0, 24);
+       const dupKey = 'h:' + verdict.batch.b + ':' + host + ':' + nonce;
+       if (BATCH_SEEN.get(dupKey)) { rejected++; continue; }
+@@ -600,10 +687,24 @@
+     return { ok: true, accepted, rejected, asn: meta.asn, scope: meta.asn ? 'asn:' + meta.asn : 'global' };
+   };
+ 
+-  /** fold the RAM buffer into D1 as aggregates (batched, bounded) */
++  /**
++   * Fold the RAM buffer into D1 as aggregates.
++   *
++   *  · D1 allows 100 bound parameters per statement, so the look-up is chunked
++   *    to 40 rows (80 parameters) — the previous single SELECT bound two
++   *    parameters per buffered row and failed silently past 50 rows, which
++   *    reset every counter to the last batch instead of accumulating.
++   *  · The counters are now accumulated *by SQL* (samples = samples + excluded),
++   *    so a lost or stale read can no longer destroy history: the delta lands
++   *    either way.  The score/state columns are recomputed from the read that
++   *    we did get and refreshed on the next flush.
++   *  · Each flush writes at most FLUSH_ROWS statements; the tick budget keeps
++   *    the whole thing inside the D1 query-per-invocation allowance.
++   */
++  const FLUSH_ROWS = 40;
+   const flushReports = async (env, ctx, opts = {}) => {
+     if (!REPORT_BUF.size) return { flushed: 0 };
+-    const take = Math.min(REPORT_BUF.size, opts.limit || 150);
++    const take = Math.min(REPORT_BUF.size, opts.limit || FLUSH_ROWS);
+     const items = [];
+     for (const [k, v] of REPORT_BUF) { if (items.length >= take) break; items.push([k, v]); }
+     for (const [k] of items) REPORT_BUF.delete(k);
+@@ -613,11 +714,17 @@
+       return { flushed: 0, requeued: items.length };
+     }
+     const now = Math.floor(Date.now() / 1000);
+-    const prevRows = await QV.safeAsync(() => QV.d1.all(env,
+-      'SELECT scope, ip, samples, ok, tls_ok, ws_ok, rtt_ms, jitter, fails, backoff, state, cooldown_until, last_ok FROM qv_ip_scores WHERE ' +
+-      items.map(() => '(scope = ? AND ip = ?)').join(' OR '),
+-      ...items.flatMap(([, v]) => [v.scope, v.ip])), []) || [];
+-    const known = new Map(prevRows.map(r => [r.scope + '|' + r.ip, r]));
++    const known = new Map();
++    let readFailed = 0;
++    for (let i = 0; i < items.length; i += FLUSH_ROWS) {
++      const slice = items.slice(i, i + FLUSH_ROWS);
++      const rows = await QV.safeAsync(() => QV.d1.all(env,
++        'SELECT scope, ip, samples, ok, tls_ok, ws_ok, rtt_ms, jitter, fails, backoff, state, cooldown_until, last_ok FROM qv_ip_scores WHERE ' +
++        slice.map(() => '(scope = ? AND ip = ?)').join(' OR '),
++        ...slice.flatMap(([, v]) => [v.scope, v.ip])), null);
++      if (!rows) { readFailed++; continue; }                    /* read failed: deltas still land */
++      for (const r of rows) known.set(r.scope + '|' + r.ip, r);
++    }
+     const stmts = [];
+     for (const [key, v] of items) {
+       const prev = known.get(key) || {};
+@@ -625,44 +732,53 @@
+       const ok = (prev.ok || 0) + v.ok;
+       const tls_ok = (prev.tls_ok || 0) + v.tls_ok;
+       const ws_ok = (prev.ws_ok || 0) + v.ws_ok;
++      const fails = (prev.fails || 0) + v.fails;
+       const rttN = v.rtt_n || 0;
+       const rttMs = rttN ? (prev.rtt_ms ? Math.round(prev.rtt_ms * 0.65 + (v.rtt_sum / rttN) * 0.35) : Math.round(v.rtt_sum / rttN)) : (prev.rtt_ms ?? null);
+       const jitter = v.jitter ? Math.round(prev.jitter ? prev.jitter * 0.7 + v.jitter * 0.3 : v.jitter) : (prev.jitter || 0);
+       const successRate = samples ? ok / samples : 0;
+-      let state = prev.state || 'active', backoff = prev.backoff || 0, cooldown_until = prev.cooldown_until || 0, fails = prev.fails || 0;
++      let state = prev.state || 'active', backoff = prev.backoff || 0, cooldown_until = prev.cooldown_until || 0;
+       if (v.fails) {
+-        fails += v.fails;
+-        const recentFailRate = v.fails / Math.max(1, v.samples);
+         if (v.samples >= 2 && successRate >= 0.8) { state = 'active'; backoff = 0; cooldown_until = 0; }
+-        else if (recentFailRate >= 0.6) { const nx = nextState({ backoff }, 'fail'); state = nx.state; backoff = nx.backoff; cooldown_until = nx.cooldown_until; }
++        else if (samples && v.fails / Math.max(1, v.samples) >= 0.6) { const nx = nextState({ backoff }, 'fail'); state = nx.state; backoff = nx.backoff; cooldown_until = nx.cooldown_until; }
+         else { state = 'degraded'; }
+       } else if (successRate >= 0.75 && samples >= 2) { state = 'active'; backoff = 0; cooldown_until = 0; }
++      const lastOkS = v.last_ok ? Math.floor(v.last_ok / 1000) : (prev.last_ok || 0);
+       const row = {
+         scope: v.scope, ip: v.ip, family: v.family, provider: v.provider, asn: v.asn,
+         samples, ok, tls_ok, ws_ok, rtt_ms: rttMs, jitter, fails, backoff, state, cooldown_until,
+-        last_ok: v.last_ok ? Math.floor(v.last_ok / 1000) : (prev.last_ok || 0),
+-        country: v.country, suspect: v.suspect || 0,
++        last_ok: lastOkS, last_probe: now, country: v.country, suspect: v.suspect || 0,
+       };
+       const scored = scoreRow({ ...row, last_ok: row.last_ok * 1000, recent_fails: 0 }, Date.now());
+       stmts.push(db.prepare(
+-        'INSERT INTO qv_ip_scores (scope,ip,family,provider,asn,samples,ok,tls_ok,ws_ok,rtt_ms,jitter,score,confidence,state,fails,backoff,cooldown_until,last_ok,country,suspect,updated_at) ' +
+-        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(scope,ip) DO UPDATE SET ' +
+-        'family=excluded.family, provider=excluded.provider, asn=excluded.asn, samples=excluded.samples, ok=excluded.ok, ' +
+-        'tls_ok=excluded.tls_ok, ws_ok=excluded.ws_ok, rtt_ms=excluded.rtt_ms, jitter=excluded.jitter, score=excluded.score, ' +
+-        'confidence=excluded.confidence, state=excluded.state, fails=excluded.fails, backoff=excluded.backoff, ' +
+-        'cooldown_until=excluded.cooldown_until, last_ok=excluded.last_ok, country=excluded.country, suspect=excluded.suspect, updated_at=excluded.updated_at')
+-        .bind(row.scope, row.ip, row.family, row.provider, row.asn, row.samples, row.ok, row.tls_ok, row.ws_ok,
+-          row.rtt_ms, row.jitter, scored.score, scored.confidence, row.state, row.fails, row.backoff,
+-          row.cooldown_until, row.last_ok, row.country, row.suspect, now));
+-    }
+-    const done = await QV.safeAsync(() => QV.d1.batch(env, stmts), null);
+-    if (!done) {
+-      for (const [k, v] of items) { const prev = REPORT_BUF.get(k); if (prev) { prev.samples += v.samples; prev.ok += v.ok; } else REPORT_BUF.set(k, v); }
+-      return { flushed: 0, error: 'batch-failed', requeued: items.length };
++        'INSERT INTO qv_ip_scores (scope,ip,family,provider,asn,samples,ok,tls_ok,ws_ok,rtt_ms,jitter,score,confidence,state,fails,backoff,cooldown_until,last_ok,last_probe,country,suspect,updated_at) ' +
++        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(scope,ip) DO UPDATE SET ' +
++        'family=excluded.family, provider=excluded.provider, asn=excluded.asn, ' +
++        'samples=qv_ip_scores.samples + excluded.samples, ok=qv_ip_scores.ok + excluded.ok, ' +
++        'tls_ok=qv_ip_scores.tls_ok + excluded.tls_ok, ws_ok=qv_ip_scores.ws_ok + excluded.ws_ok, ' +
++        'fails=qv_ip_scores.fails + excluded.fails, suspect=qv_ip_scores.suspect + excluded.suspect, ' +
++        'rtt_ms=excluded.rtt_ms, jitter=excluded.jitter, score=excluded.score, confidence=excluded.confidence, ' +
++        'state=excluded.state, backoff=excluded.backoff, cooldown_until=excluded.cooldown_until, ' +
++        'last_ok=MAX(qv_ip_scores.last_ok, excluded.last_ok), last_probe=excluded.last_probe, ' +
++        'country=excluded.country, updated_at=excluded.updated_at')
++        /* deltas only: the SQL does the accumulation */
++        .bind(row.scope, row.ip, row.family, row.provider, row.asn, v.samples, v.ok, v.tls_ok, v.ws_ok,
++          row.rtt_ms, row.jitter, scored.score, scored.confidence, row.state, v.fails, row.backoff,
++          row.cooldown_until, row.last_ok, row.last_probe, row.country, v.suspect, now));
++    }
++    let done = null;
++    for (let i = 0; i < stmts.length; i += FLUSH_ROWS) {
++      const part = stmts.slice(i, i + FLUSH_ROWS);
++      const res = await QV.safeAsync(() => QV.d1.batch(env, part), null);
++      if (!res) {
++        for (const [k, v] of items) { const prev = REPORT_BUF.get(k); if (prev) { prev.samples += v.samples; prev.ok += v.ok; } else REPORT_BUF.set(k, v); }
++        return { flushed: 0, error: 'batch-failed', requeued: items.length };
++      }
++      done = res;
+     }
+     QV.metrics.count('ci_flush_rows', items.length);
+-    if (ctx?.waitUntil) ctx.waitUntil(Promise.resolve(true));
+-    return { flushed: items.length, scopes: [...new Set(items.map(([, v]) => v.scope))].length };
++    if (readFailed) QV.metrics.count('ci_flush_readpartial', readFailed);
++    return { flushed: items.length, scopes: [...new Set(items.map(([, v]) => v.scope))].length, read_failed: readFailed, batches: Math.ceil(stmts.length / FLUSH_ROWS) };
+   };
+ 
+   /* ─────────────────── candidate generation (ε-greedy) ─────────────────── */
+@@ -745,17 +861,31 @@
+         return (rb.score || 0) - (ra.score || 0);
+       });
+     }
++    /* one entry per host:port — the same host reached over two ports is two
++       measurements, the same host twice is a browser wasting battery, and the
++       signed allow-list is a set anyway */
++    const seen = new Set();
+     const pairs = [];
+-    for (const h of hosts) for (const p of ports) pairs.push({ host: h, port: p, path });
+-    return pairs.slice(0, LIMITS.batchHosts);
++    for (const h of hosts) for (const p of ports) {
++      const k = h + '|' + p;
++      if (seen.has(k)) continue;
++      seen.add(k);
++      pairs.push({ host: h, port: p, path });
++      if (pairs.length >= LIMITS.batchHosts) return pairs;
++    }
++    return pairs;
+   };
+ 
+   /** what a browser needs to know in order to measure: ips + handles */
+   const handout = async (env, ctx, uuid, opts = {}) => {
+     const planRes = await plan(env, ctx, { count: opts.count || LIMITS.batchIps, scope: opts.scope });
+     const handles = await handlesFor(env, ctx, { ...opts, asn: opts.asn || null });
+-    const { token, batch } = await makeBatch(env, uuid, { nonce: opts.nonce });
+-    HANDOUT.set(batch.b, { ips: planRes.list.map(x => x.ip), hosts: handles.map(h => h.host), at: Date.now() }, 15 * 60 * 1000);
++    const ips = planRes.list.map(x => x.ip);
++    const hosts = handles.map(h => h.host);
++    const { token, batch } = await makeBatch(env, uuid, { nonce: opts.nonce, ips, hosts });
++    /* in-isolate copy: only used for single-use detection, never as the source
++       of truth for what was handed out (that is the signed token) */
++    HANDOUT.set(batch.b, { ips, hosts, at: Date.now() }, 15 * 60 * 1000);
+     return {
+       token, batch: batch.b, expires_in: 600,
+       ips: planRes.list.map(x => ({ ip: x.ip, family: x.family, score: x.score, samples: x.samples })),
+@@ -821,7 +951,7 @@
+     const asn = req.asn ? String(req.asn) : null;
+     const family = req.family || null;
+     const asnRows = asn ? await loadScores(env, 'asn:' + asn) : [];
+-    const globalRows = await loadScores(env, 'global');
++    const globalRows = await loadScores(env, 'global');   /* host rows are filtered below */
+     const merged = new Map();
+     for (const r of [...asnRows.map(r => ({ ...r, scope: 'asn' })), ...globalRows.map(r => ({ ...r, scope: 'global' }))]) {
+       if (!isUsable(r.ip) || !isAvailable(r)) continue;
+@@ -837,7 +967,7 @@
+        are marked unmeasured, and the browser reports that follow are what
+        promote or retire them. */
+     if (!rows.length) {
+-      const rs = await QV.safeAsync(() => ranges(req.env || null, null, {}), null);
++      const rs = await QV.safeAsync(() => ranges(req.env || null, null, { persist: false }), null);
+       const pickSample = (list, fam) => {
+         const out = [];
+         for (let i = 0; i < (list || []).length && out.length < n; i++) {
+@@ -856,10 +986,10 @@
+     const v6 = ordered.filter(r => r.family === 'v6').slice(0, n);
+     /* NAT64: when only v4 is proven, synthesise the v6 form so an IPv6-only
+        subscriber still has an address to dial */
+-    const synth = v4.slice(0, n).map(r => ({
+-      ip: QV.dns.v4ToV6 ? QV.dns.v4ToV6(r.ip) : null, source_ip: r.ip, family: 'v6',
+-      nat64: true, score: r.score, scope: r.scope, synthesized: true,
+-    })).filter(x => x.ip);
++    const synth = v4.slice(0, n).map(r => {
++      const map = QV.dns && QV.dns.v4ToV6 ? QV.dns.v4ToV6(r.ip) : null;
++      return { ip: map, source_ip: r.ip, family: 'v6', nat64: true, score: r.score, scope: r.scope, synthesized: true };
++    }).filter(x => x.ip && isUsable(x.ip, { nat64: true }));
+     return { v4, v6, nat64: synth, asn: asn, rows: ordered.length };
+   };
+ 
+@@ -876,9 +1006,13 @@
+     const db = QV.d1.db(env);
+     if (!db) return { ok: false };
+     const now = Math.floor(Date.now() / 1000);
++    /* updated_at is bumped by the decay itself: without it the WHERE clause
++       stayed true forever and a stale row lost one sample *per tick* (once a
++       minute) instead of once per 15-minute window. */
+     const r = await QV.safeAsync(() => db.prepare(
+-      'UPDATE qv_ip_scores SET score = MAX(0, score * 0.85), samples = MAX(0, samples - 1), state = CASE WHEN state = ? AND cooldown_until < ? THEN ? ELSE state END WHERE updated_at < ?'
+-    ).bind('cooldown', now, 'active', now - 900).run(), null);
++      'UPDATE qv_ip_scores SET score = MAX(0, score * 0.85), samples = MAX(0, samples - 1), ' +
++      'state = CASE WHEN state = ? AND cooldown_until < ? THEN ? ELSE state END, updated_at = ? WHERE updated_at < ?'
++    ).bind('cooldown', now, 'active', now, now - 900).run(), null);
+     const purged = await QV.safeAsync(() => db.prepare('DELETE FROM qv_ip_scores WHERE state = ? AND cooldown_until < ?').bind('purged', now - DAY).run(), null);
+     return { decayed: r ? (r.meta?.changes ?? r.changes ?? 0) : 0, purged: purged ? (purged.meta?.changes ?? purged.changes ?? 0) : 0 };
+   };
+@@ -966,6 +1100,35 @@
+     };
+   };
+ 
++  /**
++   * What feedback is allowed to talk about: the configured handle list plus
++   * the addresses/handles that already have a row.  Cached with the score
++   * cache (60 s) so a tunnel open costs no extra D1 read on the hot path.
++   */
++  const knownTargets = async (env, asn) => {
++    const key = 'known:' + (asn || '-');
++    const hit = KNOWN.get(key);
++    if (hit) return hit;
++    const cfgHosts = String(QV.env.get(env, 'HOSTS', '') || '').split(',').map(x => hostname(x.trim())).filter(Boolean);
++    const rows = [...(asn ? await loadScores(env, 'asn:' + asn) : []), ...(await loadScores(env, 'global'))];
++    const out = { hosts: new Set(cfgHosts), ips: new Set() };
++    for (const r of rows) {
++      if (!r || !r.ip) continue;
++      if (r.family === 'host') { const h = hostname(r.ip); if (h) out.hosts.add(h); }
++      else { const c = canonIp(r.ip); if (c) out.ips.add(c); }
++    }
++    KNOWN.set(key, out, 60000);
++    return out;
++  };
++
++  /** a hostname we are willing to score: no scheme, no port, no bare address */
++  const hostname = (x) => {
++    const s = String(x == null ? '' : x).trim().toLowerCase();
++    if (!s || s.length > 253 || s.includes(':') || s.includes('/')) return null;
++    if (!/^[a-z0-9](?:[a-z0-9.\-]*[a-z0-9])?\.[a-z0-9]{2,}$/.test(s)) return null;
++    return s;
++  };
++
+   /* ─────────────────────── client prober (browser) ─────────────────────── */
+   /** the script every subscription page may load; self-contained, no deps */
+   const proberJs = () => [
+@@ -1100,18 +1263,63 @@
+   /* ─────────────────────────── public surface ──────────────────────────── */
+   QV.cleanip = {
+     LIMITS, PROVIDERS, EXCLUDE_V4, EXCLUDE_V6, LAT_BUCKETS, BACKOFF,
+-    parseCidr, inCidr, isV6, isExcluded, isUsable, v4ToInt, intToV4, v6ToBytes, bytesToV6,
++    parseCidr, inCidr, isV6, isExcluded, isUsable, canonIp, hostname, cidrContains, validateRanges, v4ToInt, intToV4, v6ToBytes, bytesToV6,
+     sampleRange, percentile, latencyScore, wilsonLower, scoreRow, nextState, isAvailable,
+     ranges, plan, handout, submit, flushReports, aggregate, decay, syncPool, refill, edgeProbe,
+-    pick, audit, label, proberJs, proberPage, makeBatch, verifyBatch,
++    pick, audit, label, proberJs, proberPage, makeBatch, verifyBatch, knownTargets,
+     bufferSize: () => REPORT_BUF.size,
+-    /** tunnel feedback: a real session that authenticated is the best verdict */
+-    feedback: async (env, uuid, ip, ok, asn) => {
+-      if (!isUsable(ip)) return { ok: false, error: 'not-a-candidate' };
+-      accept({ ip, ok: !!ok, tlsOk: !!ok, wsOk: !!ok, rttMs: null }, { asn: asn || null, family: isV6(ip) ? 'v6' : 'v4', provider: 'cloudflare' });
++    /**
++     * Tunnel feedback — the second primary signal.
++     *
++     *   target  the SNI/Host the session actually used (scored in the host
++     *           scope for the caller's ASN) — always available on an upgrade
++     *   ep      the endpoint the client dialled, only when the client told us
++     *           (``?ep=<ip>``): the Worker cannot see which clean address a
++     *           client dialled, because TLS/SNI terminates on the hostname.
++     *           Guessing it would be inventing a measurement, so it is optional.
++     *
++     * A 101 on the VLESS path is issued *after* validateUserFast/quota/expiry/
++     * IP-limit, so it means "an authenticated account opened a tunnel through
++     * this host".  It is a weaker sample than a browser probe (no latency, no
++     * packet-level success), so it enters with weight 0.5 and a `tunnel`
++     * provider tag, and it can never mark an address unavailable.
++     */
++    feedback: async (env, uuid, target, ok, asn, ep, opts = {}) => {
++      const asnS = asn ? String(asn) : null;
++      const weight = Number.isFinite(opts.weight) ? opts.weight : 0.5;
++      const provider = opts.provider || 'tunnel';
++      const recorded = [];
++      /* A tunnel report confirms a candidate; it never creates one.  Both the
++         handle and the dialled address must already be known — a configured
++         host for the handle, an existing score row for the address — because
++         the upgrade itself is unauthenticated (VLESS authenticates on the first
++         frame, not at 101), so anything the client names would otherwise be
++         attacker-chosen input to the ranking. */
++      const check = opts.trusted !== true;          /* only the operator API may seed */
++      const known = check ? await knownTargets(env, asnS) : null;
++      const host = hostname(target);
++      if (host && check && !known.hosts.has(host)) { QV.count('ci_feedback_unknown_host'); return { ok: false, error: 'unknown-host' }; }
++      const first = fbOnce(uuid, host || canonIp(ep || target) || '-');
++      if (!first) { QV.count('ci_feedback_dedup'); return { ok: true, dedup: true, recorded: [] }; }
++      if (host) {
++        accept({ ip: host, family: 'host', provider, ok: !!ok, tlsOk: !!ok, wsOk: !!ok, rttMs: null, suspect: 0, weight },
++          { asn: asnS, family: 'host', provider });
++        recorded.push(host);
++      }
++      const ip = canonIp(ep || (!host ? target : null));
++      if (ip && check && !known.ips.has(ip)) { QV.count('ci_feedback_unknown_ip'); return { ok: false, error: 'unknown-endpoint' }; }
++      if (ip && isUsable(ip, { nat64: true })) {
++        accept({ ip, family: isV6(ip) ? 'v6' : 'v4', provider, ok: !!ok, tlsOk: !!ok, wsOk: !!ok, rttMs: null, suspect: 0, weight },
++          { asn: asnS, family: isV6(ip) ? 'v6' : 'v4', provider });
++        recorded.push(ip);
++      }
++      if (!recorded.length) { QV.count('ci_feedback_skipped'); return { ok: false, error: 'nothing-recorded' }; }
+       QV.count(ok ? 'ci_feedback_ok' : 'ci_feedback_fail');
+-      if (REPORT_BUF.size >= 120) return flushReports(env, null, { limit: 150 });
+-      return { ok: true, buffered: REPORT_BUF.size };
++      if (REPORT_BUF.size >= 120) {
++        const flush = flushReports(env, null, { limit: FLUSH_ROWS * 4 });
++        return { ok: true, recorded, flushed: await flush };
++      }
++      return { ok: true, recorded, buffered: REPORT_BUF.size };
+     },
+   };
+ })();
+--- a/core/10-antidpi.js
++++ b/core/10-antidpi.js
+@@ -278,7 +278,15 @@
+ 
+   /* ---------- the AI loop ------------------------------------------------ */
+   const analyse = async (env, ctx) => {
+-    if (!env?.AI) return { ok: false, reason: 'no AI binding' };
++    if (!env?.AI) {
++      /* no binding is a normal state, not an error: the deterministic
++         heuristic still produces a strategy from measured data */
++      const h = await heuristicStrategy(env, state.strategy);
++      state.strategy = h; state.lastAiRun = Date.now();
++      await QV.safeAsync(() => QV.d1.Kv.put(env, 'qv:strategy', h, 0), null);
++      QV.count('ci_strategy_heuristic');
++      return { ok: true, strategy: h, model: null, source: 'heuristic', reason: 'no AI binding' };
++    }
+     const since = state.telemetry.since;
+     const events = await QV.safeAsync(() => QV.d1.all(env,
+       `SELECT kind, COUNT(*) c FROM qv_events WHERE ts > ? GROUP BY kind ORDER BY c DESC LIMIT 20`, Math.floor(since / 1000)), []);
+@@ -291,8 +299,20 @@
+ Constraints: never suggest illegal content, never suggest attacking third parties, keep ports/transport inside the list above.
+ Return JSON with keys: shape, sni_pool, fragment{mode,size,delayMs,jitterMs}, pacing{chunkBytes,delayMs,adaptive}, padding{min,max,align}, tarpit{enabled,delayMs}, rotation{sniEverySec,ipEverySec,shapeEverySec}, iran{preferDomesticSni,preferTls13}, reason (max 12 words).`;
+     const res = await QV.ai.json(env, prompt, { kind: 'reasoning', maxTokens: 700 });
+-    if (!res.ok) return { ok: false, reason: 'ai failed' };
+-    const next = { ...state.strategy, ...res.data, version: (state.strategy.version || 0) + 1, updated_at: Date.now(), model: res.model };
++    if (!res.ok || !res.data || typeof res.data !== 'object') {
++      const h = await heuristicStrategy(env, state.strategy);
++      state.strategy = h; state.lastAiRun = Date.now();
++      await QV.safeAsync(() => QV.d1.Kv.put(env, 'qv:strategy', h, 0), null);
++      QV.count('ci_strategy_heuristic');
++      return { ok: true, strategy: h, model: null, source: 'heuristic', reason: res.error || 'ai-unusable' };
++    }
++    /* the model's JSON is a suggestion, never a command: allow-listed and
++       clamped before it can change a single byte on the wire */
++    const next = {
++      ...sanitizeStrategy(res.data, state.strategy),
++      version: (state.strategy.version || 0) + 1,
++      updated_at: Date.now(), model: res.model, source: 'ai',
++    };
+     state.strategy = next;
+     state.lastAiRun = Date.now();
+     await QV.d1.Kv.put(env, 'qv:strategy', next, 0);
+@@ -304,7 +324,9 @@
+ 
+   const load = async (env) => {
+     const saved = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:strategy', null), null);
+-    if (saved && typeof saved === 'object') state.strategy = { ...DEFAULT_STRATEGY, ...saved };
++    /* whatever is in storage is re-sanitised on the way in: a strategy written
++       by an older build (or by hand) cannot inject an out-of-range value */
++    if (saved && typeof saved === 'object') state.strategy = sanitizeStrategy(saved, DEFAULT_STRATEGY);
+     return state.strategy;
+   };
+ 
+@@ -319,5 +341,6 @@
+   });
+ 
+   return { sniPools, carriers, shapes, DEFAULT_STRATEGY, state, isProbe, tarpit, pickSni, scoreSni,
+-    fragmentProfile, profileFor, analyse, load, describe, markBlocked, activeCarrier };
++    fragmentProfile, profileFor, analyse, load, describe, markBlocked, activeCarrier,
++    sanitizeStrategy, heuristicStrategy, FRAG_MODES };
+ })();
+--- a/core/12-d1ext.js
++++ b/core/12-d1ext.js
+@@ -46,6 +46,10 @@
+        edge_score REAL DEFAULT 0, suspect INTEGER DEFAULT 0, country TEXT, meta TEXT, updated_at INTEGER DEFAULT 0,
+        PRIMARY KEY (scope, ip))`,
+     'CREATE INDEX IF NOT EXISTS ix_ip_scores_rank ON qv_ip_scores(scope, state, score)',
++    /* the engine reads `WHERE scope = ? ORDER BY score DESC LIMIT 400`:
++       (scope,state,score) cannot order that scan without a state equality,
++       this one can (and covers the hand-out ordering too) */
++    'CREATE INDEX IF NOT EXISTS ix_ip_scores_scope_score ON qv_ip_scores(scope, score DESC)',
+     `CREATE TABLE IF NOT EXISTS qv_ip_ranges (
+        provider TEXT PRIMARY KEY, family TEXT, count INTEGER DEFAULT 0, source TEXT, fetched_at INTEGER)`,
+     `CREATE TABLE IF NOT EXISTS qv_jobs (
+--- a/core/40-router.js
++++ b/core/40-router.js
+@@ -144,7 +144,14 @@
+     const up = (c.request.headers.get('upgrade') || '').toLowerCase();
+     if (up === 'websocket') {
+       if (c.params && c.params.sni) QV.antidpi.noteRequest(c.request);
+-      return handler(c.request, c.env, c.ctx, c.ip);
++      const r = await handler(c.request, c.env, c.ctx, c.ip);
++      /* A 101 is *not* authentication: VLESS authenticates on the first frame
++         inside the socket (the legacy handler does the user/quota checks in its
++         message listener), so scoring it here would let any socket inflate the
++         ranking.  It is counted as an observation only; the authenticated
++         success signal is emitted by the session path itself. */
++      if (r && r.status === 101 && r.webSocket) QV.count('ci_upgrade_seen');
++      return r;
+     }
+     /* HTTP/2 style transports (xhttp / grpc / httpupgrade over plain POST) */
+     if (c.request.method === 'POST') {
+--- a/core/42-api.js
++++ b/core/42-api.js
+@@ -291,7 +291,7 @@
+         if (action === 'audit') return ok(await QV.cleanip.audit(c.env, c.ctx));
+         if (action === 'flush') return ok(await QV.cleanip.flushReports(c.env, c.ctx, { limit: 300 }));
+         if (action === 'label') return ok(await QV.cleanip.label(c.env, c.ctx));
+-        if (action === 'feedback') return ok(await QV.cleanip.feedback(c.env, b.uuid || who.user?.uuid, b.ip, b.ok !== false, b.asn));
++        if (action === 'feedback') return ok(await QV.cleanip.feedback(c.env, b.uuid || who.user?.uuid, b.host || b.ip, b.ok !== false, b.asn, b.ep || null, { weight: 1, provider: 'operator', trusted: true }));
+         return fail('unknown action', 400);
+       }
+       /* the engine's full picture, for the panel and for a scripted check */
+--- a/core/19-legacy-shims.js
++++ b/core/19-legacy-shims.js
+@@ -91,6 +91,19 @@
+           QV.safeAsync(() => QV.d1.Sessions.open(env, { id: sessionId, uuid: header.uuid, ip: clientIP, transport: 'vless-ws', ua: request.headers.get('user-agent') }));
+           QV.emit(env, 'vless:open', 'info', { uuid: header.uuid, ip: clientIP, ctx, message: `${header.address}:${header.port}` });
+           remote = await connectToDestination(header.address, header.port, { nat64Prefixes: QV.dns.nat64PrefixesFromEnv(env) });
++          /* the one place where a tunnel success is *authenticated*: the user
++             row was found, quota/revocation/session-limit checks passed, and an
++             upstream socket is open.  That is the signal the endpoint ranking
++             wants — host always, dialled address only if the client named it. */
++          try {
++            if (QV.cleanip && QV.cleanip.feedback) {
++              let url = null; try { url = new URL(request.url); } catch (e) {}
++              const ep = (url && (url.searchParams.get('ep') || url.searchParams.get('ip'))) || '';
++              const host = String(request.headers.get('host') || '').split(':')[0];
++              const asn = (request.cf && request.cf.asn) ? String(request.cf.asn) : null;
++              QV.safeAsync(() => QV.cleanip.feedback(env, header.uuid, host, true, asn, ep));
++            }
++          } catch (e) { /* feedback must never break a working session */ }
+           writer = remote.writable.getWriter();
+           (async () => {
+             const reader = remote.readable.getReader();

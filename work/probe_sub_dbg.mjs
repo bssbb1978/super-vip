@@ -1,0 +1,11 @@
+import { boot } from './tests/helpers.mjs';
+const qv = await boot();
+const u = await qv.createUser({ name: 'dbg', quota_gb: 5 });
+const r = await qv.get('/sub/' + u.uuid);
+console.log('sub status', r.status);
+console.log((await r.text()).slice(0, 300));
+const ip = await qv.get('/clean-ip');
+console.log('clean-ip', ip.status, (await ip.text()).slice(0, 200));
+const api = await qv.json('/api/ips', { headers: qv.auth() });
+console.log('api/ips', api.status, JSON.stringify(api.data).slice(0, 200));
+await qv.dispose();

@@ -1,0 +1,13 @@
+import { boot } from './tests/helpers.mjs';
+globalThis.__DBG = true;
+const qv = await boot();
+const A = qv.auth();
+const u = await qv.createUser({ name: 'ks-probe', quota_gb: 5 });
+const sub = async () => (await qv.get('/sub/' + u.uuid)).status;
+console.log('fresh        ', await sub());
+const k1 = await qv.patch('/api/users/' + u.uuid, { killswitch: 1 }, A);
+console.log('kill patch', k1.status, '→ sub', await sub());
+const k2 = await qv.patch('/api/users/' + u.uuid, { killswitch: 0 }, A);
+console.log('revive patch', k2.status, '→ sub', await sub());
+console.log('row:', JSON.stringify((await qv.json('/api/users/' + u.uuid, { headers: A })).data.item.killswitch));
+await qv.dispose();

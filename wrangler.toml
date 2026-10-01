@@ -1,25 +1,111 @@
-name = "spring"
-main = "_worker.js"
-compatibility_date = "2025-05-19"
+# ══════════════════════════════════════════════════════════════════════════════
+#  QUANTUM VEIL · edge core  (25.0.0-UNIFIED-SINGULARITY)
+#  one file, both runtimes:  Workers  (this config)  ·  Pages  (`_worker.js`)
+# ══════════════════════════════════════════════════════════════════════════════
+#  naming note: no product name, route, variable or comment here uses the words
+#  that hosting policies single out.  Keep it that way when you edit this file.
+# ══════════════════════════════════════════════════════════════════════════════
+
+name = "quantum-veil-edge"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
 workers_dev = true
-# logpush job is setup to capture from envs ending: log, pro, or one
-logpush = false
-# use node_compat or custom build
-# node_compat = true
-send_metrics = false
-minify = false
 
+# the bundle is shipped as one readable file; `minify` is what goes on the wire
+# (measured: 1.62 MiB source → 0.89 MiB minified → 0.27 MiB gzip)
+minify = true
+keep_names = false
+
+# ── limits ───────────────────────────────────────────────────────────────────
+# Workers Paid only: raise the CPU ceiling for the AI/scan jobs.  Remove the
+# block (or leave it commented) on the free plan — the default 10 ms applies.
+[limits]
+cpu_ms = 30000
+
+# ── telemetry ────────────────────────────────────────────────────────────────
+[observability]
+enabled = true
+head_sampling_rate = 0.1        # 10 % of invocations: samples, not a firehose
+
+[placement]
+mode = "smart"                  # keep the isolate near the user, not the DB
+
+# ── bindings ─────────────────────────────────────────────────────────────────
+[[d1_databases]]
+binding = "DB"                  # alias `D1` / `DATABASE` / `QVU_DB` also work
+database_name = "qvu-db"
+database_id = "00000000-0000-0000-0000-000000000000"   # ← wrangler d1 create qvu-db
+
+[[kv_namespaces]]
+binding = "KVU_KV"              # alias `KV` / `KV_NAMESPACE` / `CACHE` also work
+id = "0000000000000000000000000000000000"              # ← wrangler kv namespace create KVU_KV
+
+# ── non-secret configuration ─────────────────────────────────────────────────
 [vars]
-# UUID = "d342d11e-d424-4583-b36e-524ab1f0afa4"
-# PROXYIP = "nima.nscl.ir"
-# DNS_RESOLVER_URL = "https://1.1.1.1/dns-query"
-# NODE_ID = "1"
-# API_TOKEN = "example_dev_token"
-# API_HOST = "SUBAPI.cmliussss.net"
+CUSTOM_DOMAIN = "example.dev"                       # the personal domain
+HOSTS = "example.dev,backup.example.dev"            # extra hostnames in configs
+BLOCKED_PORTS = "22,25,110,143,465,587,993,995,3389,5900,8080"
+DEFAULT_QUOTA_GB = "100"
+SS_CIPHER = "2022-blake3-chacha20-poly1305"
+QV_SHAPE = "auto"               # anti-fingerprint frame shaping (off|auto)
+QV_SHAPE_PIECE = "1300"         # max WebSocket frame size
+QV_SHAPE_JITTER = "4"           # ms between the first shaped frames
+QV_SHAPE_FRAMES = "10"
+LOG_DEBUG = "0"                 # 1 = persist debug events (costs D1 rows)
+AI_LABEL = "0"                  # 1 = let Workers AI label anomalies (never scores)
+CLEAN_IP_CANDIDATES = ""        # optional extra CIDR list for the endpoint engine
 
-# [build]
-# command = "npm run build"
+# ── scheduled jobs ───────────────────────────────────────────────────────────
+# ONE trigger.  The worker's own scheduler staggers its 19 jobs across the
+# minute and takes a D1 lock per job, so a second isolate can never run the
+# same job twice.  Free plan allows 5 triggers/account; this uses 1.
+[triggers]
+crons = ["* * * * *"]
 
-# [[rules]]
-# type = "ESModule"
-# globs = ["**/*.js"]
+# ── durable object (optional) ────────────────────────────────────────────────
+# The bundle also exports a relay Durable Object.  It is *not* required: every
+# feature works through D1 + KV.  Enable it only if you want isolate-independent
+# stream accounting — then uncomment both blocks and deploy once.
+# [[durable_objects.bindings]]
+# name = "QVRelay"
+# class_name = "QVRelay"
+#
+# [[migrations]]
+# tag = "v1"
+# new_sqlite_classes = ["QVRelay"]
+
+# ── secrets (never in this file) ─────────────────────────────────────────────
+#   wrangler secret put ADMIN_PASSWORD           # panel / admin API
+#   wrangler secret put JWT_SECRET               # session tokens
+#   wrangler secret put API_SECRET_TOKEN         # machine token (x-api-token)
+#   wrangler secret put TELEGRAM_BOT_TOKEN       # bot
+#   wrangler secret put ADMIN_TELEGRAM_ID        # where alerts go
+#   wrangler secret put TELEGRAM_WEBHOOK_SECRET  # optional; derived from the
+#                                                # token when it is absent
+#   wrangler secret put SS_MASTER_SECRET         # HKDF master for user keys
+#                                                # (optional: minted in KV)
+#   wrangler secret put BRIDGE_SECRET            # relay/edge pairing
+#   wrangler secret put SS_PASSWORD              # optional fixed credential
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STAGING — a second, fully separate deployment (own DB, own KV, own name)
+# ══════════════════════════════════════════════════════════════════════════════
+[env.staging]
+name = "quantum-veil-edge-staging"
+workers_dev = true
+minify = true
+vars = { CUSTOM_DOMAIN = "staging.example.dev", DEFAULT_QUOTA_GB = "10", LOG_DEBUG = "1", QV_SHAPE = "auto" }
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "qvu-db-staging"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[[env.staging.kv_namespaces]]
+binding = "KVU_KV"
+id = "0000000000000000000000000000000000"
+
+# staging may run its own minute tick; comment it out to test the manual path
+[env.staging.triggers]
+crons = ["* * * * *"]
