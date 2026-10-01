@@ -230,7 +230,9 @@ jobs:
         run: node scripts/build-bundle.mjs --verify-only --meta dist/worker.meta.json --out dist/worker.js
 
       - name: Install wrangler
-        run: npm install --no-save --no-audit --no-fund wrangler@^4
+        # acorn is installed here as well so the deploy-time verify-only gate
+        # runs the AST export-surface check too, instead of skipping it
+        run: npm install --no-save --no-audit --no-fund wrangler@^4 acorn@^8
 
       - name: Apply non-secret configuration from repository variables
         env:
