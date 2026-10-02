@@ -8492,52 +8492,81 @@ Otherwise reply with plain text only. Be concise and technical.`;
   /** env-configured admins — always trusted, never written by the claim flow */
   const envIds = (env) => digits(get(env, 'ADMIN_TELEGRAM_ID', '') || get(env, 'ADMIN_CHAT_ID', ''));
 
-  /* ── the pepper: stable across isolates and deploys by construction ──────
-   *  Everything the claim flow stores is an HMAC under this value, so it must
-   *  be identical in every isolate and survive a redeploy.  The ladder below
-   *  walks from "explicitly configured" to "derived from the deployment's own
-   *  secrets" to "minted once and kept in D1".  Step 3 matters: a node that
-   *  configured *nothing* still gets a stable pepper, because QV.env.secrets()
-   *  itself persists generated credentials in `qv:keys` — so two isolates
-   *  booting at the same time converge instead of each minting their own.
+  /* ── the pepper: committed once, stable for the life of the database ─────
+   *  Everything the claim flow stores or transports is an HMAC under this value
+   *  — the code digests in D1, and the id fingerprints that travel inside
+   *  Telegram callback payloads and console buttons — so it has to be identical
+   *  in every isolate *and* identical after a redeploy.
+   *
+   *  The ladder is: an explicit OWNER_PEPPER → the pepper already committed to
+   *  this database → one derived from the deployment's own secrets → a minted
+   *  one.  Reading the committed value *before* deriving is the whole point:
+   *  deriving from live secrets means that rotating ADMIN_PASSWORD, the bot
+   *  token or the API token silently re-keys every fingerprint, and from that
+   *  moment `byFp` resolves nothing — the "revoke" and "role" buttons in
+   *  Telegram and in the console keep rendering but stop working, with no error
+   *  anywhere.  One committed row removes that failure mode entirely.
+   *
+   *  Is keeping it in D1 safe?  `qv_admins` already holds the raw chat ids, so
+   *  anybody who can read this database learns nothing new from the key that
+   *  protects them.  What the pepper defends is the data that *leaves* D1
+   *  (callbacks, JSON, logs), and for anybody without the database those stay
+   *  exactly as one-way as before.
+   *
+   *  Committing is `INSERT … ON CONFLICT DO NOTHING` plus a re-read, so two
+   *  isolates booting at the same moment converge on one value instead of each
+   *  keeping its own.
    * ──────────────────────────────────────────────────────────────────────── */
+  const PEPPER_KEY = 'qv:owner:pepper';
+  const isPepper = (v) => /^[0-9a-f]{32,128}$/i.test(String(v || ''));
   const pepperCache = new Map();
+
+  const readPepper = async (env) => {
+    const v = await QV.safeAsync(() => QV.d1.Kv.get(env, PEPPER_KEY, null), null);
+    return isPepper(v) ? String(v) : '';
+  };
+  const commitPepper = async (env, candidate) => {
+    if (!env || !env.DB) return candidate;         // nowhere to commit to
+    await QV.safeAsync(() => QV.d1.run(env,
+      `INSERT INTO qv_kv (key,value,expires_at) VALUES (?,?,NULL) ON CONFLICT(key) DO NOTHING`,
+      PEPPER_KEY, JSON.stringify(candidate)), null);
+    QV.lru.delete('kv:' + PEPPER_KEY);             // re-read the winner, not our guess
+    return (await readPepper(env)) || candidate;
+  };
+  const derive = async (material) =>
+    QV.hex(await QV.hmacSha256(QV.utf8('qv-owner-pepper-v1'), QV.utf8(material)));
+
   const pepperOf = async (env) => {
     const explicit = String(get(env, 'OWNER_PEPPER', '') || '');
-    if (explicit) return explicit;
-    const cacheKey = [
-      get(env, 'TELEGRAM_BOT_TOKEN', ''), get(env, 'ADMIN_PASSWORD', ''),
-      get(env, 'JWT_SECRET', ''), get(env, 'API_SECRET_TOKEN', ''),
-    ].map(v => String(v || '')).join('|');
-    if (pepperCache.has(cacheKey)) return pepperCache.get(cacheKey);
+    if (explicit) return explicit;                 // operator-pinned: never stored
+    if (pepperCache.has('p')) return pepperCache.get('p');
+    /* only memoise once the value is durable — an uncommitted candidate from a
+       request that raced the schema must not stick for the life of the isolate */
+    const keep = (p) => { if (env && env.DB) pepperCache.set('p', p); return p; };
+
+    const committed = await readPepper(env);
+    if (committed) return keep(committed);
 
     const fromEnv = [
       get(env, 'TELEGRAM_WEBHOOK_SECRET', ''), get(env, 'TELEGRAM_BOT_TOKEN', ''),
       get(env, 'JWT_SECRET', ''), get(env, 'API_SECRET_TOKEN', ''), get(env, 'ADMIN_PASSWORD', ''),
     ].map(v => String(v || '')).join('|');
-    if (fromEnv.replace(/\|/g, '')) {
-      const p = QV.hex(await QV.hmacSha256(QV.utf8('qv-owner-pepper-v1'), QV.utf8(fromEnv)));
-      pepperCache.set(cacheKey, p);
-      return p;
-    }
+    if (fromEnv.replace(/\|/g, '')) return keep(await commitPepper(env, await derive(fromEnv)));
+
     /* nothing configured: fall back to the credentials the env module already
        generated and persisted, which are stable for the life of the database */
     const sec = await QV.safeAsync(() => QV.env.secrets(env, null), null);
-    const derived = [sec?.jwt, sec?.api, sec?.bridge, sec?.adminPassword].map(v => String(v || '')).join('|');
-    if (derived.replace(/\|/g, '')) {
-      const p = QV.hex(await QV.hmacSha256(QV.utf8('qv-owner-pepper-v1'), QV.utf8(derived)));
-      pepperCache.set(cacheKey, p);
-      return p;
-    }
-    /* last resort — no D1, no secrets at all: keep one minted pepper */
-    const stored = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:pepper', null), null);
-    if (stored) { pepperCache.set(cacheKey, String(stored)); return String(stored); }
-    const fresh = QV.hex(QV.rand(24));
-    await QV.safeAsync(() => QV.d1.Kv.put(env, 'qv:owner:pepper', fresh, 0), null);
-    /* re-read: if another isolate won the race, use its value, not ours */
-    const winner = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:pepper', fresh), fresh);
-    pepperCache.set(cacheKey, String(winner || fresh));
-    return String(winner || fresh);
+    const fromStore = [sec?.jwt, sec?.api, sec?.bridge, sec?.adminPassword].map(v => String(v || '')).join('|');
+    if (fromStore.replace(/\|/g, '')) return keep(await commitPepper(env, await derive(fromStore)));
+
+    return keep(await commitPepper(env, QV.hex(QV.rand(24))));
+  };
+
+  /** diagnostics only — never the value itself */
+  const pepperSource = async (env) => {
+    if (String(get(env, 'OWNER_PEPPER', '') || '')) return 'env';
+    if (await readPepper(env)) return 'd1';
+    return (env && env.DB) ? 'derived' : 'ephemeral';
   };
 
   const normalize = (code) => String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -8810,6 +8839,11 @@ Otherwise reply with plain text only. Be concise and technical.`;
       pending_codes: Number(pending && pending.n || 0),
       queued_alerts: Array.isArray(queued) ? queued.length : 0,
       locked: locked(env),
+      /* diagnostics: where the HMAC pepper comes from.  `d1` means fingerprints
+         survive rotating ADMIN_PASSWORD / the bot token; `env` means the
+         operator pinned OWNER_PEPPER; anything else is a node without durable
+         storage, where nothing else works either */
+      pepper_source: await QV.safeAsync(() => pepperSource(env), 'ephemeral'),
       claimed_at: meta && meta.at ? meta.at : null,
       mode: locked(env) ? 'env-only' : (res.owners.length ? 'bound' : 'claimable'),
     };
@@ -8835,7 +8869,7 @@ Otherwise reply with plain text only. Be concise and technical.`;
     ALPHABET, mask, envIds, resolve, recipientIds, roleOf, isAdmin, isOwner: async (env, chat) => (await roleOf(env, chat)) === 'owner',
     unclaimed, rowsOf, status, locked, byFp, resolveTarget,
     /* keyed handles — never reversible, safe to transport */
-    tag, fpOf, digestOf,
+    tag, fpOf, digestOf, pepperSource,
     /* lifecycle */
     invite, redeem, add, remove, rotate, sync, deepLink,
     /* notification plumbing (used by the telegram module) */
@@ -12239,6 +12273,18 @@ QV.qr = (() => {
         const b = await QV.owner.digestOf(env, 'aaaa bbbb');   // normalised
         const c = await QV.owner.digestOf(env, 'AAAA-BBBC');
         return a === b && a !== c && /^[0-9a-f]{64}$/.test(a);
+      }));
+      /* the invariant that keeps Telegram/console buttons working after an
+         operator rotates ADMIN_PASSWORD or the bot token: the pepper in use is
+         the one committed to D1, not one re-derived from the live secrets */
+      out.push(await t('the owner pepper is committed, so fingerprints outlive a secret rotation', async () => {
+        const src = await QV.owner.pepperSource(env);
+        const fp = await QV.owner.fpOf(env, '123456789');
+        if (src === 'env') return /^[0-9a-f]{12}$/.test(fp);      // pinned by the operator
+        if (src !== 'd1') return !(env && env.DB);                // no durable store at all
+        const p = String(await QV.d1.Kv.get(env, 'qv:owner:pepper', '') || '');
+        const want = QV.hex(await QV.hmacSha256(QV.utf8(p), QV.utf8('id:123456789'))).slice(0, 12);
+        return want === fp;
       }));
       out.push(await t('a chat id is only ever exposed masked or fingerprinted', async () => {
         const id = '123456789';

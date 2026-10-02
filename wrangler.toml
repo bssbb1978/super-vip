@@ -68,9 +68,12 @@ OWNER_NOTIFY_TRIES = "5"        # delivery attempts per parked alert before it i
                                 # dropped (the `owner-alerts` cron task retries)
 OWNER_LOCK = "0"                # 1 = refuse all claiming (env id only)
 # OWNER_PEPPER = ""             # optional: pin the HMAC pepper for codes and
-                                # id fingerprints.  Left empty it is derived from
-                                # your existing secrets, so it is stable across
-                                # isolates and redeploys without being stored.
+                                # id fingerprints.  Left empty it is derived once
+                                # from your existing secrets and committed to D1
+                                # (qv:owner:pepper), so it stays stable across
+                                # isolates, redeploys *and* secret rotation —
+                                # which is what keeps the fingerprint handles in
+                                # Telegram buttons and the console resolving.
 
 # ── scheduled jobs ───────────────────────────────────────────────────────────
 # ONE trigger.  The worker's own scheduler staggers its 19 jobs across the

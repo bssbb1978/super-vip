@@ -12,6 +12,7 @@
  *   · nothing that leaves the worker contains a raw chat id
  * ═══════════════════════════════════════════════════════════════════════════ */
 import { describe, test, expect, beforeAll, afterAll } from 'vitest';
+import { createHmac } from 'node:crypto';
 import { boot, sleep, TG_SECRET } from './helpers.mjs';
 
 /* deliberately NO ADMIN_TELEGRAM_ID anywhere in this suite */
@@ -396,6 +397,30 @@ describe('owner binding: the bot works with no ADMIN_TELEGRAM_ID', () => {
       expect(left.length === 0 || left.every(i => Number(i.tries) >= 1)).toBe(true);
     } finally { await fresh.dispose(); }
   }, 90000);
+
+  /* ── fingerprint stability ────────────────────────────────────────────────
+     The revoke/role buttons in Telegram and in the console address an admin by
+     a 12-hex fingerprint instead of by chat id.  If the pepper behind it were
+     still derived from the live secrets, rotating ADMIN_PASSWORD or the bot
+     token would re-key every handle at once: the buttons would keep rendering
+     and silently resolve to nobody.  So the pepper is committed to D1 once. */
+  test('the pepper is committed to D1 and the fingerprints follow from it', async () => {
+    const rows = (await db.prepare("SELECT value FROM qv_kv WHERE key = 'qv:owner:pepper'").all()).results;
+    expect(rows.length).toBe(1);
+    const pepper = JSON.parse(rows[0].value);
+    expect(pepper).toMatch(/^[0-9a-f]{64}$/);
+
+    const s = await ownerGet();
+    expect(s.pepper_source).toBe('d1');
+
+    /* recomputed independently of the worker: HMAC-SHA256(pepper, 'id:'+chat) */
+    const fp = (id) => createHmac('sha256', pepper).update('id:' + id).digest('hex').slice(0, 12);
+    const owner = s.admins.find(a => a.role === 'owner');
+    expect(owner).toBeTruthy();
+    expect(owner.fp).toBe(fp('424242424'));
+    expect(owner.id).not.toContain('424242424');      // masked, never raw
+    expect(JSON.stringify(s)).not.toContain('424242424');
+  });
 
   test('retries are bounded: a doomed alert is dropped, not retried forever', async () => {
     const fresh = await boot({ TELEGRAM_BOT_TOKEN: '123456:TEST-TOKEN', OWNER_NOTIFY_TRIES: '1' });

@@ -655,6 +655,18 @@
         const c = await QV.owner.digestOf(env, 'AAAA-BBBC');
         return a === b && a !== c && /^[0-9a-f]{64}$/.test(a);
       }));
+      /* the invariant that keeps Telegram/console buttons working after an
+         operator rotates ADMIN_PASSWORD or the bot token: the pepper in use is
+         the one committed to D1, not one re-derived from the live secrets */
+      out.push(await t('the owner pepper is committed, so fingerprints outlive a secret rotation', async () => {
+        const src = await QV.owner.pepperSource(env);
+        const fp = await QV.owner.fpOf(env, '123456789');
+        if (src === 'env') return /^[0-9a-f]{12}$/.test(fp);      // pinned by the operator
+        if (src !== 'd1') return !(env && env.DB);                // no durable store at all
+        const p = String(await QV.d1.Kv.get(env, 'qv:owner:pepper', '') || '');
+        const want = QV.hex(await QV.hmacSha256(QV.utf8(p), QV.utf8('id:123456789'))).slice(0, 12);
+        return want === fp;
+      }));
       out.push(await t('a chat id is only ever exposed masked or fingerprinted', async () => {
         const id = '123456789';
         const m = QV.owner.mask(id);
