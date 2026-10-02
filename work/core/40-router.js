@@ -504,6 +504,10 @@ p{color:#93a0c4;margin:6px 0}b{color:#5b8cff}.box{margin-top:18px;border:1px sol
     { id: 'ai-refresh', every: 21600, budgetMs: 20000, run: async (env, ctx) => QV.ai.refresh(env, ctx) },
     { id: 'health-probe', every: 1800, budgetMs: 15000, run: async (env, ctx) => QV.ai.probe(env, ctx) },
     { id: 'telegram-poll', every: 120, budgetMs: 8000, run: async (env, ctx) => QV.telegram.pollOnce(env, ctx) },
+    /* alerts parked while the node had no owner go out the moment one exists —
+       including an owner bound from the panel or from a secret added later,
+       which never passes through the Telegram /claim path */
+    { id: 'owner-alerts', every: 300, budgetMs: 8000, run: async (env) => QV.telegram.flushQueue(env) },
     { id: 'metrics-rollup', every: 900, budgetMs: 10000, run: async (env) => QV.metrics.rollup(env) },
     { id: 'jobs-gc', every: 900, budgetMs: 5000, run: async (env) => QV.d1.Jobs.gc(env) },
     { id: 'backup', every: 86400, budgetMs: 25000, run: async (env, ctx) => QV.d1.exportAll(env, { toKv: true, ctx }) },

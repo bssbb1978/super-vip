@@ -156,10 +156,19 @@
     switch (seg[0]) {
       /* ── identity ────────────────────────────────────────────────────── */
       case 'me': {
-        if (isAdmin) return ok({ role: 'admin', via: who.via, version: QV.VERSION, features: Object.keys(cfg.features || {}).filter(k => cfg.features[k]) });
+        if (isAdmin) {
+          /* the console reads `owner` to decide whether the “Connect Telegram”
+             card should be a warning or a normal status line */
+          const owner = QV.owner ? await QV.safeAsync(() => QV.owner.status(c.env), null) : null;
+          return ok({
+            role: 'admin', via: who.via, version: QV.VERSION,
+            features: Object.keys(cfg.features || {}).filter(k => cfg.features[k]),
+            owner: owner ? { claimed: owner.claimed, mode: owner.mode, admins: owner.admins.length, locked: owner.locked } : null,
+          });
+        }
         return ok({ role: 'user', user: sanitizeUser(who.user), token: '' });
       }
-      case undefined: return ok({ api: true, version: QV.VERSION, routes: ['login','logout','me','stats','users','sessions','strategy','sni','ips','endpoints','dns','ai','events','cron','jobs','cache','ss','shape','selftest','backup','hosts','sub','tg'] });
+      case undefined: return ok({ api: true, version: QV.VERSION, routes: ['login','logout','me','stats','users','sessions','strategy','sni','ips','endpoints','dns','ai','events','cron','jobs','cache','ss','shape','selftest','backup','hosts','sub','owner','tg'] });
 
       /* ── dashboard ───────────────────────────────────────────────────── */
       case 'stats': {
@@ -479,12 +488,61 @@
         }
         return ok({ url: built.subUrl, format, nodes: built.uris ? built.uris.length : undefined, hints: built.hints, preview: String(built.body).slice(0, 400) });
       }
+      /* ── owner binding: how the node finds its operator without
+            ADMIN_TELEGRAM_ID (31-owner.js).  Everything here needs an admin
+            session, and nothing here ever returns a raw chat id. ───────── */
+      case 'owner': {
+        const g = needAdmin(); if (g) return g;
+        if (!QV.owner) return fail('owner module unavailable', 501);
+        if (method === 'GET') return ok(await QV.owner.status(c.env));
+        if (method === 'DELETE') {
+          const target = seg[1];
+          if (!target) return fail('telegram id required', 400);
+          return ok(await QV.owner.remove(c.env, c.ctx, target));
+        }
+        const b = await body(c.request);
+        const action = String(b.action || 'status');
+        if (action === 'invite' || action === 'mint') {
+          /* rate-limited per session: minting codes must not be spammable even
+             by somebody who already holds the admin password */
+          const bucket = QV.tokenBucket('owner:api:' + (who.via || 'x'), 10, 4);
+          if (!bucket.take()) return fail('slow down', 429);
+          const r = await QV.owner.invite(c.env, c.ctx, {
+            ttl_min: b.ttl_min, by: 'api:' + who.via, via: 'api',
+          });
+          if (!r.ok) return fail(r.error || 'invite failed', 409);
+          return ok(r);
+        }
+        if (action === 'rotate') return ok(await QV.owner.rotate(c.env, c.ctx));
+        if (action === 'add') {
+          const r = await QV.owner.add(c.env, c.ctx, b.telegram_id || b.chat_id, b.role || 'admin', b.name || '');
+          /* an admin bound by id never passes through Telegram's /claim, so the
+             alerts queued while the node was unclaimed are delivered right now
+             instead of waiting for the owner-alerts cron tick */
+          if (r && r.ok && QV.telegram && QV.telegram.flushQueue && c.ctx && c.ctx.waitUntil) {
+            c.ctx.waitUntil(QV.telegram.flushQueue(c.env).catch(() => {}));
+          }
+          return ok(r);
+        }
+        if (action === 'remove') return ok(await QV.owner.remove(c.env, c.ctx, b.telegram_id || b.chat_id || seg[1]));
+        if (action === 'status') return ok(await QV.owner.status(c.env));
+        return fail('unknown action', 400);
+      }
+
       case 'tg': {
         const g = needAdmin(); if (g) return g;
         if (method === 'GET') return ok(await QV.telegram.status(c.env));
         const b = await body(c.request);
         if (b.action === 'setup') { const r = await QV.telegram.ensureWebhook(c.env, c.ctx, c.url.origin); return ok(r); }
-        if (b.action === 'send') { const r = await QV.telegram.send(c.env, b.chat_id || QV.env.get(c.env, 'ADMIN_TELEGRAM_ID', ''), b.text, b.keyboard); return ok(r); }
+        /* `send` without a chat_id means "the operators": fan out through the
+           resolved recipient list instead of reading ADMIN_TELEGRAM_ID */
+        if (b.action === 'send') {
+          const r = b.chat_id
+            ? await QV.telegram.send(c.env, b.chat_id, b.text, b.keyboard)
+            : await QV.telegram.notifyAdmin(c.env, b.text, b.keyboard);
+          return ok(r);
+        }
+        if (b.action === 'notify') return ok(await QV.telegram.notifyAdmin(c.env, b.text, b.keyboard));
         if (b.action === 'broadcast') { const r = await QV.telegram.broadcast(c.env, c.ctx, b.text, b.filter || {}); return ok(r); }
         if (b.action === 'unset') { await QV.telegram.deleteWebhook(c.env); return ok({ webhook: 'removed' }); }
         return fail('unknown action', 400);

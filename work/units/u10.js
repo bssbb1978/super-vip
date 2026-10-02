@@ -500,8 +500,20 @@ class QuantumAIOrchestrator {
 ────────────────`;
 
     const botToken = env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) return;
+
+    /* The destination is no longer an env var: the core control plane resolves
+       every bound owner/admin from D1 (qv_admins), so this legacy alert path
+       keeps working on a deployment that never set ADMIN_TELEGRAM_ID.  While
+       nobody is bound the message is queued in D1 instead of being dropped.
+       The raw fetch below stays as the fallback for a bundle without the core. */
+    if (globalThis.QV && QV.telegram && QV.telegram.notifyAdmin) {
+      const r = await QV.telegram.notifyAdmin(env, message, null, { html: false });
+      if (r && r.ok) { console.log('📨 AI Alert Sent to Telegram'); return; }
+      if (r && r.queued) { console.log('📨 AI Alert queued — no owner bound yet'); return; }
+    }
     const chatId = env.ADMIN_TELEGRAM_ID;
-    if (!botToken || !chatId) return;
+    if (!chatId) return;
 
     try {
       await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {

@@ -59,13 +59,17 @@ wrangler secret put ADMIN_PASSWORD           # ورود پنل/API مدیر
 wrangler secret put JWT_SECRET               # امضای نشست‌ها
 wrangler secret put API_SECRET_TOKEN         # توکن ماشینی (هدر x-api-token)
 wrangler secret put TELEGRAM_BOT_TOKEN       # توکن ربات
-wrangler secret put ADMIN_TELEGRAM_ID        # مقصد هشدارها
 wrangler secret put SS_MASTER_SECRET         # ★ کلید مادر برای اشتقاق کلید کاربران (HKDF)
 wrangler secret put BRIDGE_SECRET            # جفت‌سازی گره/رله
 # اختیاری:
 wrangler secret put TELEGRAM_WEBHOOK_SECRET  # اگر ندهید، از توکن ربات مشتق می‌شود
 wrangler secret put SS_PASSWORD              # یک اعتبار ثابت Shadowsocks (فول‌بک)
+wrangler secret put ADMIN_TELEGRAM_ID        # ⛔ لازم نیست — بخش ۳-۲ را ببینید
+wrangler secret put OWNER_PEPPER             # اختیاری: پپر ثابت HMAC کدها
 ```
+
+> **`ADMIN_TELEGRAM_ID` دیگر الزامی نیست.** ربات به‌جای «تنظیم‌شدن»، **تصاحب (claim)**
+> می‌شود. برای دیدن روش، بخش **۳-۲** را بخوانید.
 
 > `SS_MASTER_SECRET` را از دست ندهید: کلیدهای هر کاربر با
 > `HKDF-SHA256(master, uuid, "AXR-SS-AEAD-V1")` ساخته می‌شوند؛ عوض‌کردنش همهٔ کلیدها را
@@ -73,7 +77,118 @@ wrangler secret put SS_PASSWORD              # یک اعتبار ثابت Shadow
 
 ---
 
-## ۴) دامنهٔ شخصی
+## ۳-۲) اتصال تلگرام بدون `ADMIN_TELEGRAM_ID` (کاملاً خودکار)
+
+قبلاً باید شناسهٔ عددی چت تلگرام خودتان را دستی پیدا می‌کردید و به‌عنوان secret
+ثبت می‌کردید. حالا **لازم نیست**؛ گره مالک خودش را *پیدا* می‌کند، نه اینکه تنظیم شود.
+
+### چرا این روش امن است و شما را «شناسایی» نمی‌کند
+
+| نکته | رفتار |
+|---|---|
+| شناسهٔ چت در کد/مخزن | هرگز وجود ندارد؛ فقط در D1 (جدول `qv_admins`) ذخیره می‌شود |
+| شناسهٔ چت در URL، لاگ، `/health`، HTML | هرگز؛ فقط شکل **پوشیده** (`•••••2424`) خارج می‌شود |
+| کد اتصال در D1 | فقط **چکیدهٔ HMAC-SHA256** ذخیره می‌شود، نه خود کد |
+| مقایسهٔ کد | **زمان‌ثابت** (`timingSafeEqual`) — بدون timing attack |
+| مصرف کد | **اتمی** با `INSERT OR IGNORE` روی کلید اصلی؛ دو ایزولهٔ همزمان هر دو موفق نمی‌شوند |
+| اعتبار کد | پیش‌فرض ۳۰ دقیقه، **یک‌بارمصرف**؛ کد باطل/منقضی/غلط همه **یک پیام خنثی** می‌گیرند |
+| شرط چت | فقط **گفتگوی خصوصی** و فقط وقتی `from.id === chat.id` (گروه/کانال رد می‌شود) |
+| حدس زدن کد | ۴۹.۵ بیت آنتروپی + الفبای بدون `I L O 0 1` + محدودیت نرخ (۶ در دقیقه، ۱۲ خطا → ۱۰ دقیقه قفل) |
+| دسترسی ناشناس | `/api/owner` بدون نشست مدیر → `401`. صفحهٔ ورود هیچ راهنمایی دربارهٔ claim نمی‌دهد |
+| نقش‌ها | `owner` > `admin` > `viewer`؛ شناسهٔ ست‌شده از راه env هرگز از چت قابل حذف/تنزل نیست |
+| هشدارهای زودهنگام | تا وقتی مالک متصل نشده، در D1 **صف** می‌شوند و لحظهٔ اتصال تحویل داده می‌شوند (چیزی گم نمی‌شود) |
+
+### قدم‌به‌قدم
+
+1. **استقرار** مثل قبل (`wrangler deploy`) — بدون `ADMIN_TELEGRAM_ID`.
+2. مرورگر را باز کنید: `https://<دامنهٔ شما>/admin` و با `ADMIN_PASSWORD` وارد شوید.
+   > اگر `ADMIN_PASSWORD` را هم نگذاشته باشید، Worker خودش یکی می‌سازد و در
+   > `qv_kv → qv:keys` ذخیره می‌کند و در لاگ اولین اجرا چاپ می‌کند.
+3. تب **🔐 «دسترسی تلگرام»** را باز کنید. وضعیت را `claimable` می‌بینید.
+4. دکمهٔ **«🔑 ساخت کد اتصال»** را بزنید. یک کد مثل `PUQGH-ETRSM` می‌گیرید
+   (به‌همراه لینک `https://t.me/<bot>?start=claim_...` اگر نام کاربری ربات شناخته شود).
+5. در **گفتگوی خصوصی** با ربات یکی از این دو را بفرستید:
+   - `/claim PUQGH-ETRSM`
+   - یا `/start claim_PUQGHERTSM` (همان چیزی که لینک عمیق می‌فرستد)
+6. تمام. پیام «🎉 شما اکنون **مالک** این گره هستید» را می‌گیرید و از همان لحظه
+   `/stats /users /find /add /quota /kill /revive /broadcast /strategy /hunt
+   /selftest /ai /logs /backup /admins` فعال است و همهٔ هشدارها به چت شما می‌آید.
+
+### معادل خط فرمانی (بدون مرورگر)
+
+```bash
+TOKEN="<API_SECRET_TOKEN>"
+BASE="https://<دامنهٔ شما>"
+
+curl -s -H "x-api-token: $TOKEN" $BASE/api/owner                      # وضعیت
+curl -s -H "x-api-token: $TOKEN" -H 'content-type: application/json' \
+     -d '{"action":"invite"}' $BASE/api/owner                         # ساخت کد
+curl -s -H "x-api-token: $TOKEN" -H 'content-type: application/json' \
+     -d '{"action":"rotate"}' $BASE/api/owner                         # باطل کردن همهٔ کدها
+curl -s -H "x-api-token: $TOKEN" -H 'content-type: application/json' \
+     -d '{"action":"add","telegram_id":"123456789","role":"admin"}' $BASE/api/owner
+curl -s -X DELETE -H "x-api-token: $TOKEN" $BASE/api/owner/<fingerprint>
+```
+
+> حذف/تغییر نقش از راه **اثرانگشت** (fingerprint) انجام می‌شود: یک HMAC ۱۲-کاراکتری
+> که به شناسهٔ واقعی قابل بازگشت نیست، پس حتی در دکمه‌های تلگرام و HTML هم
+> شناسهٔ خام جابه‌جا نمی‌شود.
+
+### داخل ربات (دستور `/admins` — فقط مالک)
+
+- 🔗 ساخت کد اتصال جدید
+- ➕ افزودن مدیر با شناسهٔ عددی (`123456789 admin`)
+- ♻️ باطل کردن همهٔ کدهای در انتظار
+- 🗑 گرفتن دسترسی هر ردیف (جز شناسهٔ env که قفل است)
+
+### صف هشدارها و کرون `owner-alerts`
+
+هشدارهایی که **قبل از اتصال مالک** تولید می‌شوند در D1 (`qv:owner:queue`) ذخیره می‌شوند و
+هرگز دور ریخته نمی‌شوند. تحویل در سه نقطه انجام می‌شود:
+
+1. لحظهٔ `/claim` در تلگرام؛
+2. بلافاصله پس از `POST /api/owner {action:"add"}` (اتصال مدیر با شناسه از کنسول)؛
+3. وظیفهٔ کرون **`owner-alerts`** هر ۵ دقیقه — برای حالتی که مالک «از راه دیگری»
+   ظاهر شود (بازیابی بکاپ، یا `wrangler secret put ADMIN_TELEGRAM_ID` بعداً).
+
+خروجی از صف به‌معنی تحویل‌گرفتن نیست: اگر ارسال ناموفق باشد (۴۲۹/قطعی شبکه) همان
+هشدار با شمارندهٔ `tries` به صف برمی‌گردد و پس از `OWNER_NOTIFY_TRIES` تلاش، با ثبت
+رویداد `tg:notify` حذف می‌شود.
+
+### پپر اثرانگشت‌ها: یک بار نوشته، برای همیشه ثابت
+
+دکمه‌های تلگرام (`callback_data`) و دکمهٔ «لغو دسترسی» در کنسول، مدیر را با
+**اثرانگشت ۱۲-هگزی** صدا می‌زنند نه با شناسهٔ خام. این اثرانگشت
+`HMAC-SHA256(pepper, 'id:' + chat)` است. اگر pepper هر بار از رازهای زنده مشتق
+می‌شد، با یک `wrangler secret put ADMIN_PASSWORD` همهٔ اثرانگشت‌ها عوض می‌شدند و
+دکمه‌ها **بدون هیچ خطایی** به هیچ ردیفی نمی‌رسیدند.
+
+پس pepper یک بار مشتق و با `INSERT … ON CONFLICT DO NOTHING` در D1 ثبت می‌شود و از
+آن پس همیشه همان خوانده می‌شود (`/api/owner → pepper_source: "d1"`). دو ایزولهٔ
+همزمان هم روی یک مقدار همگرا می‌شوند. اگر `OWNER_PEPPER` را ست کنید، همان بر همه
+چیز اولویت دارد و هرگز روی دیسک نوشته نمی‌شود.
+
+> **آیا ذخیرهٔ pepper در D1 امن است؟** جدول `qv_admins` همین حالا شناسهٔ خام را
+> نگهداری می‌کند، پس هرکس به این پایگاه داده دسترسی داشته باشد چیز تازه‌ای یاد
+> نمی‌گیرد؛ pepper از داده‌ای محافظت می‌کند که **از D1 بیرون می‌رود** (callback،
+> JSON، لاگ) و برای کسی که پایگاه داده را ندارد دقیقاً مثل قبل یک‌طرفه می‌ماند.
+
+### متغیرهای اختیاری (همه در `wrangler.toml → [vars]`)
+
+| متغیر | پیش‌فرض | نقش |
+|---|---|---|
+| `OWNER_CLAIM_TTL_MIN` | `30` | اعتبار کد به دقیقه (۱ تا ۱۴۴۰) |
+| `OWNER_MAX_ADMINS` | `8` | سقف ردیف‌های غیر-`viewer` در `qv_admins` |
+| `OWNER_NOTIFY_QUEUE` | `50` | حداکثر هشدار در صف تا قبل از اتصال مالک |
+| `OWNER_NOTIFY_TRIES` | `5` | تعداد تلاش ارسال برای هر هشدارِ در صف؛ بعد از آن حذف می‌شود تا حلقهٔ بی‌پایان نسازد |
+| `OWNER_LOCK` | `0` | `1` =claim کاملاً غیرفعال (فقط شناسهٔ env) |
+| `OWNER_PEPPER` | *(خالی)* | پپر HMAC کدها و اثرانگشت‌ها. اگر خالی باشد **یک بار** از رازهای موجود مشتق و در D1 (`qv:owner:pepper`) ثبت می‌شود |
+
+> **اولویت:** اگر `ADMIN_TELEGRAM_ID` را ست کرده باشید، همان **همیشه مالک** است و
+> رفتار قبلی مو‌به‌مو حفظ می‌شود؛ هر claim جدید فقط `admin` می‌شود. هیچ رفتار قدیمی
+> نمی‌شکند.
+
+---
 
 1. دامنه را در Cloudflare اضافه کنید (Nameserverها).
 2. در `wrangler.toml` مقدار `CUSTOM_DOMAIN` و `HOSTS` را با دامنهٔ خودتان پر کنید.
@@ -137,6 +252,10 @@ pages_build_output_dir = "public"
 - ادمین (`uuid = admin`) و یک حساب نمونه
 - ۵۸ میزبان SNI و ۲۴ آی‌پی تمیز (بذر اولیه) و «استراتژی» اولیهٔ ضد‑DPI
 - رازهای KV (کلید JWT، کلیدهای Shadowsocks) در صورت نبودشان
+- **همگام‌سازی مالک**: اگر `ADMIN_TELEGRAM_ID` داده باشید، همان شناسه به‌صورت
+  `role='owner'` در `qv_admins` materialise می‌شود تا نقش‌ها، fan-out هشدارها و
+  فهرست مدیران همه یک حرف بزنند. اگر نداده باشید، گره در وضعیت `claimable`
+  می‌ماند و منتظر `/claim` شماست (بخش ۳-۲)
 - راه‌اندازی وبهوک تلگرام (اگر توکن داده باشید) — از مسیر `/api/tg` با `{"action":"setup"}`
 
 ---
@@ -281,8 +400,9 @@ curl -s "$DOMAIN/api/endpoints" -H "x-api-token: $TOKEN" | jq '{per_isp, blocks,
 |---|---|
 | `CLOUDFLARE_API_TOKEN` | توکن API با دسترسی ویرایش Workers + D1 + KV |
 | `CLOUDFLARE_ACCOUNT_ID` | شناسهٔ اکانت Cloudflare |
-| `ADMIN_PASSWORD`, `JWT_SECRET`, `API_SECRET_TOKEN`, `TELEGRAM_BOT_TOKEN`, `ADMIN_TELEGRAM_ID`, `SS_MASTER_SECRET`, `BRIDGE_SECRET` | همان رازهایی که در بخش ۳ با `wrangler secret put` دستی تنظیم می‌شدند؛ حالا هر اجرای Action آن‌ها را به‌صورت خودکار (و idempotent) با `wrangler secret put` به Worker می‌فرستد |
-| `TELEGRAM_WEBHOOK_SECRET`, `SS_PASSWORD` | اختیاری؛ اگر ست نشوند، همان رفتار پیش‌فرض قبلی (مشتق‌شدن خودکار / نبودن فول‌بک) حفظ می‌شود |
+| `ADMIN_PASSWORD`, `JWT_SECRET`, `API_SECRET_TOKEN`, `TELEGRAM_BOT_TOKEN`, `SS_MASTER_SECRET`, `BRIDGE_SECRET` | همان رازهایی که در بخش ۳ با `wrangler secret put` دستی تنظیم می‌شدند؛ حالا هر اجرای Action آن‌ها را به‌صورت خودکار (و idempotent) با `wrangler secret put` به Worker می‌فرستد |
+| `ADMIN_TELEGRAM_ID` | **اختیاری شده** — دیگر در فهرست «الزامی» نیست. اگر ست نشود، ربات از راه پنل claim می‌شود (بخش ۳-۲). اگر ست شود، اولویت دارد و همیشه `owner` می‌ماند |
+| `TELEGRAM_WEBHOOK_SECRET`, `SS_PASSWORD`, `OWNER_PEPPER` | اختیاری؛ اگر ست نشوند، همان رفتار پیش‌فرض قبلی (مشتق‌شدن خودکار / نبودن فول‌بک) حفظ می‌شود |
 
 اگر یکی از رازهای الزامی نباشد، job با یک پیام مشخص شکست می‌خورد (نه با خطای مبهم wrangler)؛
 این یعنی خطا هوشمند تشخیص داده می‌شود، نه این‌که سکوت کند و چیزی ناقص مستقر شود.

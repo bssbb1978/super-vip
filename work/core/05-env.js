@@ -26,6 +26,10 @@
     PROBE_TARPIT_MS: '1800', BAN_MINUTES: '60', ALLOW_COUNTRIES: '', DENY_COUNTRIES: 'KP',
     /* telegram */
     TELEGRAM_BOT_TOKEN: '', ADMIN_TELEGRAM_ID: '', DISABLE_WEBHOOK: '0',
+    /* owner binding — the bot is claimed from an authenticated session, so no
+       ADMIN_TELEGRAM_ID has to be configured by hand (31-owner.js) */
+    OWNER_CLAIM_TTL_MIN: '30', OWNER_MAX_ADMINS: '8', OWNER_NOTIFY_QUEUE: '50',
+    OWNER_NOTIFY_TRIES: '5', OWNER_PEPPER: '', OWNER_LOCK: '0',
     /* upstreams */
     DoH_UPSTREAMS: 'https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.quad9.net/dns-query,https://doh.opendns.com/dns-query,https://dns.adguard-dns.com/dns-query',
     FALLBACK_UPSTREAM: 'dns.google',
@@ -239,6 +243,10 @@
       steps.bootstrap = await QV.safeAsync(() => QV.d1.bootstrap(aliased, { QUOTA_GB_DEFAULT: String(get(env, 'DEFAULT_QUOTA_GB', DEFAULTS.DEFAULT_QUOTA_GB)) }), null);
       /* the tables the merged generations expect (their own writers keep them) */
       steps.legacySchema = await QV.safeAsync(() => QV.legacySchema && QV.legacySchema.ensure(aliased), null);
+      /* env-configured owner ids are materialised in qv_admins, so the role
+         lookup, the notification fan-out and the admin list all agree — and a
+         deployment without ADMIN_TELEGRAM_ID simply stays claimable */
+      steps.owner = await QV.safeAsync(() => QV.owner && QV.owner.sync(aliased, ctx), null);
       const seeded = await QV.safeAsync(() => QV.d1.Kv.get(aliased, 'qv:boot:seeded', null), null);
       if (!seeded) {
         await QV.safeAsync(() => QV.antidpi.seed(aliased), null);
@@ -274,6 +282,15 @@
       adminPassword: sec.adminPassword, apiToken: sec.api, jwtSecret: sec.jwt, bridgeSecret: sec.bridge,
       generatedSecrets: sec.generated,
       telegram: { token: get(env, 'TELEGRAM_BOT_TOKEN', ''), adminId: String(get(env, 'ADMIN_TELEGRAM_ID', '') || '') },
+      owner: {
+        envConfigured: !!String(get(env, 'ADMIN_TELEGRAM_ID', '') || get(env, 'ADMIN_CHAT_ID', '') || ''),
+        claimTtlMin: Number(get(env, 'OWNER_CLAIM_TTL_MIN', DEFAULTS.OWNER_CLAIM_TTL_MIN)),
+        maxAdmins: Number(get(env, 'OWNER_MAX_ADMINS', DEFAULTS.OWNER_MAX_ADMINS)),
+        notifyQueue: Number(get(env, 'OWNER_NOTIFY_QUEUE', DEFAULTS.OWNER_NOTIFY_QUEUE)),
+        notifyTries: Number(get(env, 'OWNER_NOTIFY_TRIES', DEFAULTS.OWNER_NOTIFY_TRIES)),
+        lock: bool(env, 'OWNER_LOCK', false),
+        pepperConfigured: !!get(env, 'OWNER_PEPPER', ''),
+      },
       hosts: list(env, 'HOSTS', []).concat(list(env, 'CUSTOM_DOMAIN', [])),
       wsPath: get(env, 'WS_PATH', DEFAULTS.WS_PATH),
       nat64: { prefix: get(env, 'NAT64_PREFIX', DEFAULTS.NAT64_PREFIX), enabled: bool(env, 'DNS64_ENABLED', true) },

@@ -1032,7 +1032,14 @@ class TelegramBot {
   }
   
   static async sendMessage(chatId, text, env) {
+    /* No explicit destination: hand it to the core control plane, which
+       resolves every bound owner/admin from D1 (qv_admins) — so this legacy
+       alert path works with no ADMIN_TELEGRAM_ID configured at all. */
+    if (!chatId && globalThis.QV && QV.telegram && QV.telegram.notifyAdmin) {
+      return QV.telegram.notifyAdmin(env, text);
+    }
     const token = env.TELEGRAM_BOT_TOKEN;
+    if (!token || !chatId) return { ok: false, error: 'no bot token or destination' };
     const url = `https://api.telegram.org/bot${token}/sendMessage`;
     await fetch(url, {
       method: 'POST',
@@ -1040,11 +1047,11 @@ class TelegramBot {
       body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' })
     });
   }
-  
+
   static async sendAIAlert(env, forensics, strategy) {
-    const adminId = env.ADMIN_TELEGRAM_ID;
     const message = `🤖 Quantum Alert\nAnalysis: ${forensics.substring(0, 100)}\nStrategy: Mimic ${strategy.mimic}, Padding ${strategy.padding}\nStatus: Healed`;
-    await this.sendMessage(adminId, message, env);
+    /* destination resolved by the owner module, not by an env var */
+    await this.sendMessage(env.ADMIN_TELEGRAM_ID || null, message, env);
   }
   
   static async getStats(env) {

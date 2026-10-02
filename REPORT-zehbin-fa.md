@@ -185,6 +185,11 @@ keep_names = false
 ```
 رازها (خارج از فایل): `ADMIN_PASSWORD`, `JWT_SECRET`, `API_SECRET_TOKEN`, `TELEGRAM_BOT_TOKEN`,
 `ADMIN_TELEGRAM_ID`, `SS_MASTER_SECRET`, `BRIDGE_SECRET` (+ اختیاری `TELEGRAM_WEBHOOK_SECRET`, `SS_PASSWORD`).
+
+> **الحاقیه (PR #2):** `ADMIN_TELEGRAM_ID` دیگر **الزامی نیست** و در فهرست بالا هم اختیاری
+> شده است. ربات به‌جای تنظیم‌شدن، از پنل **claim** می‌شود و شناسهٔ چت مدیر فقط در D1
+> (جدول `qv_admins`) می‌نشیند — نه در secret، نه در var، نه در URL و نه در لاگ.
+> قدم‌به‌قدم: `DEPLOY-fa.md` بخش ۳-۲.
 دربارهٔ حجم: صفحهٔ رسمی محدودیت‌ها اکنون **۶۴MiB پس از فشرده‌نشدن** برای هر دو پلن می‌گوید
 (سبت ۵، ۲۰۲۶ سقف فشردهٔ ۳/۱۰MiB برداشته شد). بستهٔ ما ۱٫۶۲MiB خام و ۰٫۲۷MiB gzip است — در هر دو رژیم بی‌خطر.
 

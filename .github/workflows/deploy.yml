@@ -252,7 +252,10 @@ jobs:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           API_SECRET_TOKEN: ${{ secrets.API_SECRET_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          # optional: without it the bot is claimed from /admin → 🔐 Telegram
+          # access → /claim CODE, and the id lives in D1 instead of a secret
           ADMIN_TELEGRAM_ID: ${{ secrets.ADMIN_TELEGRAM_ID }}
+          OWNER_PEPPER: ${{ secrets.OWNER_PEPPER }}
           SS_MASTER_SECRET: ${{ secrets.SS_MASTER_SECRET }}
           BRIDGE_SECRET: ${{ secrets.BRIDGE_SECRET }}
           TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}

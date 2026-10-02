@@ -394,6 +394,9 @@
       }));
       out.push(await t('a bad strategy is rolled back to the previous version', async () => {
         await QV.d1.run(env, 'DELETE FROM qv_ip_scores WHERE scope = ?', 'asn:778001');
+        /* isolate from earlier checks: their block/outage windows (10 % success) would
+           otherwise be read as the strategy's "recent baseline" and mask the drop */
+        await QV.d1.run(env, "DELETE FROM qv_ip_windows WHERE scope = 'global'");
         for (let i = 0; i < 5; i++) {
           await QV.d1.run(env, 'INSERT INTO qv_ip_scores (scope,ip,family,samples,ok,state,updated_at) VALUES (?,?,?,?,?,?,?)',
             'asn:778001', '10.7.0.' + i, 'v4', 20, 4, 'active', Math.floor(Date.now() / 1000));
@@ -617,6 +620,82 @@
         const st = await QV.d1.Fsm.get(env, chat);
         await QV.d1.Fsm.clear(env, chat);
         return st.state === 'awaiting' && st.data.step === 2;
+      }));
+      /* ── KV expiry is stored in unix *seconds*; a millisecond comparison made
+            every TTL'd row look expired on the first cross-isolate read ────── */
+      out.push(await t('a TTL value survives a cold read and expires on time', async () => {
+        const key = 'qv:selfcheck:ttl:' + QV.shortId(4);
+        await QV.d1.Kv.put(env, key, { n: 7 }, 300);
+        QV.lru.delete('kv:' + key);                       // force the D1 path
+        const warm = await QV.d1.Kv.get(env, key, null);
+        QV.lru.delete('kv:' + key);
+        const row = await QV.d1.one(env, `SELECT expires_at FROM qv_kv WHERE key = ?`, key);
+        const inSeconds = Number(row?.expires_at || 0) < Math.floor(Date.now() / 1000) + 301;
+        await QV.d1.Kv.del(env, key);
+        return !!warm && warm.n === 7 && inSeconds;
+      }));
+      out.push(await t('an expired TTL value is not returned', async () => {
+        const key = 'qv:selfcheck:exp:' + QV.shortId(4);
+        /* written in the past by hand, exactly as a stale row would look */
+        await QV.d1.run(env, `INSERT INTO qv_kv (key,value,expires_at) VALUES (?,?,?)
+                              ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at`,
+          key, JSON.stringify({ stale: true }), Math.floor(Date.now() / 1000) - 60);
+        QV.lru.delete('kv:' + key);
+        const got = await QV.d1.Kv.get(env, key, 'default');
+        await QV.d1.run(env, `DELETE FROM qv_kv WHERE key = ?`, key);
+        QV.lru.delete('kv:' + key);
+        return got === 'default';
+      }));
+      /* ── owner binding primitives (31-owner.js).  The real claim flow is not
+            exercised here: redeeming a synthetic chat would steal the owner
+            role on a node that has not been claimed yet. ─────────────────── */
+      out.push(await t('the owner pepper is stable across calls', async () => {
+        const a = await QV.owner.digestOf(env, 'AAAA-BBBB');
+        const b = await QV.owner.digestOf(env, 'aaaa bbbb');   // normalised
+        const c = await QV.owner.digestOf(env, 'AAAA-BBBC');
+        return a === b && a !== c && /^[0-9a-f]{64}$/.test(a);
+      }));
+      /* the invariant that keeps Telegram/console buttons working after an
+         operator rotates ADMIN_PASSWORD or the bot token: the pepper in use is
+         the one committed to D1, not one re-derived from the live secrets */
+      out.push(await t('the owner pepper is committed, so fingerprints outlive a secret rotation', async () => {
+        const src = await QV.owner.pepperSource(env);
+        const fp = await QV.owner.fpOf(env, '123456789');
+        if (src === 'env') return /^[0-9a-f]{12}$/.test(fp);      // pinned by the operator
+        if (src !== 'd1') return !(env && env.DB);                // no durable store at all
+        const p = String(await QV.d1.Kv.get(env, 'qv:owner:pepper', '') || '');
+        const want = QV.hex(await QV.hmacSha256(QV.utf8(p), QV.utf8('id:123456789'))).slice(0, 12);
+        return want === fp;
+      }));
+      out.push(await t('a chat id is only ever exposed masked or fingerprinted', async () => {
+        const id = '123456789';
+        const m = QV.owner.mask(id);
+        const fp = await QV.owner.fpOf(env, id);
+        return m && !m.includes(id) && m.endsWith('6789') && /^[0-9a-f]{12}$/.test(fp) && fp !== id;
+      }));
+      out.push(await t('an admin fingerprint resolves back to exactly one row', async () => {
+        const id = '99' + String(Date.now()).slice(-8);
+        await QV.d1.run(env, `INSERT INTO qv_admins (telegram_id, name, role) VALUES (?, 'selfcheck', 'viewer')
+                              ON CONFLICT(telegram_id) DO NOTHING`, id);
+        const fp = await QV.owner.fpOf(env, id);
+        const row = await QV.owner.byFp(env, fp);
+        const unknown = await QV.owner.byFp(env, 'deadbeefcafe');
+        await QV.d1.run(env, `DELETE FROM qv_admins WHERE telegram_id = ?`, id);
+        return !!row && String(row.telegram_id) === id && row.role === 'viewer' && !unknown;
+      }));
+      out.push(await t('claim consumption is atomic (INSERT OR IGNORE wins once)', async () => {
+        const key = 'qv:selfcheck:claim:' + QV.shortId(6);
+        const first = await QV.d1.run(env, `INSERT OR IGNORE INTO qv_kv (key,value,expires_at) VALUES (?,?,?)`, key, '1', null);
+        const second = await QV.d1.run(env, `INSERT OR IGNORE INTO qv_kv (key,value,expires_at) VALUES (?,?,?)`, key, '1', null);
+        const changes = (r) => Number((r && r.meta && r.meta.changes) ?? (r && r.changes) ?? 0);
+        await QV.d1.run(env, `DELETE FROM qv_kv WHERE key = ?`, key);
+        return changes(first) === 1 && changes(second) === 0;
+      }));
+      out.push(await t('the owner status never leaks a raw chat id', async () => {
+        const s = await QV.owner.status(env);
+        const blob = JSON.stringify(s);
+        const leak = (await QV.owner.rowsOf(env)).some(r => String(r.telegram_id).length > 4 && blob.includes(String(r.telegram_id)));
+        return typeof s.claimed === 'boolean' && Array.isArray(s.admins) && !leak;
       }));
       out.push(await t('events log accepts writes', async () => {
         /* `info` is the lowest severity that is persisted — `debug` stays in

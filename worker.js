@@ -49,9 +49,14 @@ import { connect } from 'cloudflare:sockets';
  *    1. wrangler d1 create qvu-db          → put the id into wrangler.toml
  *    2. wrangler kv namespace create QVU_KV
  *    3. define secrets:  ADMIN_PASSWORD, JWT_SECRET, API_SECRET_TOKEN,
- *       TELEGRAM_BOT_TOKEN, ADMIN_TELEGRAM_ID, BRIDGE_SECRET
+ *       TELEGRAM_BOT_TOKEN, BRIDGE_SECRET
+ *       (ADMIN_TELEGRAM_ID is optional — see step 6)
  *    4. wrangler deploy
  *    5. open  https://<your-worker>/admin   (first run migrates the schema)
+ *    6. bind Telegram: tab 🔐 → "New claim code" → send `/claim CODE` in a
+ *       private chat with the bot.  That chat becomes the owner and is stored
+ *       in D1 (qv_admins), so no admin id ever lives in a secret, a var, a URL
+ *       or a log line.  See work/core/31-owner.js.
  *
  *  NOTE: no `worker.js` name tokens such as "vpn"/"proxy" are used in URLs,
  *  route names or UI strings — see the naming rules in the security section.
@@ -794,7 +799,13 @@ QV.d1 = (() => {
       if (c !== undefined) return c;
       const row = await one(env, 'SELECT value, expires_at FROM qv_kv WHERE key = ?', key);
       if (!row) { if (env?.KV) { const v = await QV.safeAsync(() => env.KV.get(key, 'json')); if (v != null) { QV.lru.set('kv:' + key, v); return v; } } return dflt; }
-      if (row.expires_at && row.expires_at / 1000 < Date.now()) return dflt;
+      /* `expires_at` is written in unix *seconds* (see `put` below, and the
+         dns-cache pruner in 27-dns-extra).  Comparing it against Date.now()
+         in milliseconds made every TTL'd row look expired the instant it was
+         read back from D1 — only the in-isolate LRU hid it, so FSM state,
+         dedupe markers and rate-limit counters silently reset across deploys
+         and isolates. */
+      if (row.expires_at && Number(row.expires_at) * 1000 < Date.now()) return dflt;
       const v = QV.safe(() => JSON.parse(row.value), row.value);
       QV.lru.set('kv:' + key, v);
       return v;
@@ -1175,6 +1186,10 @@ QV.emit = (env, kind, severity = 'info', o = {}) => {
     PROBE_TARPIT_MS: '1800', BAN_MINUTES: '60', ALLOW_COUNTRIES: '', DENY_COUNTRIES: 'KP',
     /* telegram */
     TELEGRAM_BOT_TOKEN: '', ADMIN_TELEGRAM_ID: '', DISABLE_WEBHOOK: '0',
+    /* owner binding — the bot is claimed from an authenticated session, so no
+       ADMIN_TELEGRAM_ID has to be configured by hand (31-owner.js) */
+    OWNER_CLAIM_TTL_MIN: '30', OWNER_MAX_ADMINS: '8', OWNER_NOTIFY_QUEUE: '50',
+    OWNER_NOTIFY_TRIES: '5', OWNER_PEPPER: '', OWNER_LOCK: '0',
     /* upstreams */
     DoH_UPSTREAMS: 'https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.quad9.net/dns-query,https://doh.opendns.com/dns-query,https://dns.adguard-dns.com/dns-query',
     FALLBACK_UPSTREAM: 'dns.google',
@@ -1388,6 +1403,10 @@ QV.emit = (env, kind, severity = 'info', o = {}) => {
       steps.bootstrap = await QV.safeAsync(() => QV.d1.bootstrap(aliased, { QUOTA_GB_DEFAULT: String(get(env, 'DEFAULT_QUOTA_GB', DEFAULTS.DEFAULT_QUOTA_GB)) }), null);
       /* the tables the merged generations expect (their own writers keep them) */
       steps.legacySchema = await QV.safeAsync(() => QV.legacySchema && QV.legacySchema.ensure(aliased), null);
+      /* env-configured owner ids are materialised in qv_admins, so the role
+         lookup, the notification fan-out and the admin list all agree — and a
+         deployment without ADMIN_TELEGRAM_ID simply stays claimable */
+      steps.owner = await QV.safeAsync(() => QV.owner && QV.owner.sync(aliased, ctx), null);
       const seeded = await QV.safeAsync(() => QV.d1.Kv.get(aliased, 'qv:boot:seeded', null), null);
       if (!seeded) {
         await QV.safeAsync(() => QV.antidpi.seed(aliased), null);
@@ -1423,6 +1442,15 @@ QV.emit = (env, kind, severity = 'info', o = {}) => {
       adminPassword: sec.adminPassword, apiToken: sec.api, jwtSecret: sec.jwt, bridgeSecret: sec.bridge,
       generatedSecrets: sec.generated,
       telegram: { token: get(env, 'TELEGRAM_BOT_TOKEN', ''), adminId: String(get(env, 'ADMIN_TELEGRAM_ID', '') || '') },
+      owner: {
+        envConfigured: !!String(get(env, 'ADMIN_TELEGRAM_ID', '') || get(env, 'ADMIN_CHAT_ID', '') || ''),
+        claimTtlMin: Number(get(env, 'OWNER_CLAIM_TTL_MIN', DEFAULTS.OWNER_CLAIM_TTL_MIN)),
+        maxAdmins: Number(get(env, 'OWNER_MAX_ADMINS', DEFAULTS.OWNER_MAX_ADMINS)),
+        notifyQueue: Number(get(env, 'OWNER_NOTIFY_QUEUE', DEFAULTS.OWNER_NOTIFY_QUEUE)),
+        notifyTries: Number(get(env, 'OWNER_NOTIFY_TRIES', DEFAULTS.OWNER_NOTIFY_TRIES)),
+        lock: bool(env, 'OWNER_LOCK', false),
+        pepperConfigured: !!get(env, 'OWNER_PEPPER', ''),
+      },
       hosts: list(env, 'HOSTS', []).concat(list(env, 'CUSTOM_DOMAIN', [])),
       wsPath: get(env, 'WS_PATH', DEFAULTS.WS_PATH),
       nat64: { prefix: get(env, 'NAT64_PREFIX', DEFAULTS.NAT64_PREFIX), enabled: bool(env, 'DNS64_ENABLED', true) },
@@ -7461,6 +7489,10 @@ QV.dns = (() => {
 
   const cfgOf = (env) => ({
     token: env.TELEGRAM_BOT_TOKEN || env.BOT_TOKEN || '',
+    /* legacy spelling — kept for compatibility, but the authoritative list of
+       people who may command this node is resolved by QV.owner (31-owner.js):
+       env id first, then every row of qv_admins.  Nothing here needs
+       ADMIN_TELEGRAM_ID to be configured any more. */
     adminId: String(env.ADMIN_TELEGRAM_ID || env.ADMIN_CHAT_ID || ''),
     secret: env.TELEGRAM_WEBHOOK_SECRET || '',
   });
@@ -7500,10 +7532,83 @@ QV.dns = (() => {
   const answer = (env, id, text, alert) => call(env, 'answerCallbackQuery', { callback_query_id: id, text: text ? String(text).slice(0, 190) : undefined, show_alert: !!alert });
 
   const kb = (rows) => ({ inline_keyboard: rows });
-  const notifyAdmin = async (env, text, keyboard) => {
-    const { adminId } = cfgOf(env);
-    if (!adminId) return { ok: false, error: 'ADMIN_TELEGRAM_ID not set' };
-    return send(env, adminId, text, keyboard);
+
+  /* ──────────────────── notification fan-out ────────────────────────────
+   * `notifyAdmin` used to be one chat id from the environment; if that id was
+   * missing the message was dropped and the caller got an error nobody read.
+   * Now it resolves the recipient list from QV.owner (env id + qv_admins),
+   * delivers to all of them, and — while the bot is still unclaimed — parks
+   * the alert in D1 so nothing that happened before the claim is lost.
+   * ───────────────────────────────────────────────────────────────────── */
+  const recipients = async (env) => {
+    if (!QV.owner) return cfgOf(env).adminId ? [cfgOf(env).adminId] : [];
+    return QV.safeAsync(() => QV.owner.recipientIds(env), []) || [];
+  };
+
+  const flushQueue = async (env, keyboard) => {
+    if (!QV.owner) return { flushed: 0 };
+    /* check the recipient list *before* draining: an owner can be bound from
+       the panel or from a secret that appears later, and until then the queue
+       must stay exactly as it is (this runs from cron every few minutes) */
+    const ids = await recipients(env);
+    if (!ids.length) return { flushed: 0, skipped: 'no-owner' };
+    const pending = await QV.owner.drainQueue(env);
+    if (!pending.length) return { flushed: 0, drained: 0 };
+    let flushed = 0; const undelivered = [];
+    for (const item of pending) {
+      const r = await notifyAdmin(env, item.text, keyboard, { via: 'queue' });
+      if (r.ok) flushed += r.sent || 0; else undelivered.push(item);
+      await QV.sleep(45);
+    }
+    /* draining is not acknowledgement — put back whatever did not go out */
+    const back = undelivered.length ? await QV.owner.requeueAlerts(env, undelivered) : { queued: 0, dropped: 0 };
+    if (undelivered.length) {
+      QV.emit(env, 'tg:notify', back.dropped ? 'error' : 'warn', {
+        message: `queued alert(s) could not be delivered — requeued (${back.queued} pending` +
+          (back.dropped ? `, ${back.dropped} dropped after too many attempts` : '') + ')',
+      });
+    }
+    return {
+      flushed, drained: pending.length, requeued: undelivered.length,
+      dropped: back.dropped || 0, pending: back.queued || 0,
+    };
+  };
+
+  const notifyAdmin = async (env, text, keyboard, opts = {}) => {
+    const ids = await recipients(env);
+    if (!ids.length) {
+      /* no owner yet: keep the alert instead of dropping it on the floor */
+      if (!opts.via || opts.via !== 'queue') {
+        const q = QV.owner ? await QV.owner.queueAlert(env, text) : { queued: 0 };
+        QV.emit(env, 'tg:notify', 'warn', {
+          message: `no telegram owner bound — alert queued (${q.queued} pending); claim the bot from the panel`,
+        });
+        return { ok: false, queued: q.queued, error: 'no owner bound' };
+      }
+      return { ok: false, sent: 0, error: 'no owner bound' };
+    }
+    let sent = 0, skipped = 0; const failed = [];
+    /* `html:false` lets a legacy caller send plain text (the merged generations
+       write Markdown, which must not be parsed as HTML) */
+    const sendOpts = { silent: !!opts.silent, html: opts.html };
+    /* `except` keeps the actor from being told about their own action — the
+       chat that just claimed already got its confirmation a line earlier */
+    const skip = new Set((Array.isArray(opts.except) ? opts.except : opts.except ? [opts.except] : []).map(String));
+    for (const id of ids) {
+      if (skip.has(String(id))) { skipped++; continue; }
+      const r = await send(env, id, text, keyboard, sendOpts);
+      if (r.ok) sent++; else failed.push(QV.owner ? QV.owner.mask(id) : id);
+      await QV.sleep(45);   // Telegram's ~30 msg/s ceiling, per destination
+    }
+    return { ok: sent > 0 || skipped > 0, sent, skipped, failed: failed.length, recipients: ids.length, errors: failed };
+  };
+
+  /** critical events: every owner/admin gets the alert, deduplicated per hour */
+  const alert = async (env, text, keyboard, dedupeKey) => {
+    const key = 'qv:tg:alert:' + QV.hex(QV.utf8(String(dedupeKey || text))).slice(0, 16);
+    if (await QV.safeAsync(() => QV.d1.Kv.get(env, key, false), false)) return { ok: true, deduped: true };
+    await QV.safeAsync(() => QV.d1.Kv.set(env, key, Date.now(), 3600), null);
+    return notifyAdmin(env, '⚠️ ' + text, keyboard);
   };
 
   /* ─────────────────────────── FSM (D1) ───────────────────────────────── */
@@ -7537,6 +7642,21 @@ QV.dns = (() => {
       support_sent: '✅ پیام شما برای پشتیبانی ارسال شد.',
       ai_thinking: '🤖 در حال تحلیل…',
       no_perm: '⛔️ دسترسی ندارید.',
+      /* owner binding (31-owner.js) */
+      claim_ask: '🔑 کد یک‌بارمصرف را از پنل مدیریت بگیرید و به شکل <code>/claim CODE</code> بفرستید.',
+      claim_ok: '✅ چت شما با نقش <b>{role}</b> به گره متصل شد.',
+      claim_owner: '🎉 شما اکنون <b>مالک</b> این گره هستید — بدون هیچ متغیر محیطی.\n\nدستورها: /stats /users /admins /selftest',
+      claim_bad: '❌ انجام نشد.',
+      claim_used: '❌ این کد پیش‌تر استفاده شده است.',
+      claim_locked: '❌ اتصال خودکار در این استقرار غیرفعال است.',
+      claim_private: '❌ اتصال فقط در گفتگوی خصوصی با ربات ممکن است.',
+      claim_wait: '⏳ تعداد تلاش زیاد است؛ چند دقیقه دیگر دوباره امتحان کنید.',
+      owner_title: '🔐 دسترسی تلگرام',
+      owner_none: 'هیچ مدیری متصل نیست. از پنل وب «اتصال تلگرام» را بزنید تا کد یک‌بارمصرف ساخته شود.',
+      owner_added: '✅ شناسه اضافه شد.',
+      owner_removed: '🗑 دسترسی گرفته شد.',
+      owner_rotated: '♻️ همهٔ کدهای در انتظار باطل شدند.',
+      owner_add_ask: 'شناسهٔ عددی تلگرام را بفرستید:',
     },
     en: {
       welcome: (n) => `👋 Welcome, <b>${n}</b>.\nPick an option below.`,
@@ -7554,6 +7674,21 @@ QV.dns = (() => {
       support_sent: '✅ Your message was delivered to support.',
       ai_thinking: '🤖 thinking…',
       no_perm: '⛔️ Not allowed.',
+      /* owner binding (31-owner.js) */
+      claim_ask: '🔑 Get a single-use code from the admin panel, then send <code>/claim CODE</code> here.',
+      claim_ok: '✅ This chat is now bound to the node as <b>{role}</b>.',
+      claim_owner: '🎉 You are the <b>owner</b> of this node — no environment variable was needed.\n\nTry: /stats /users /admins /selftest',
+      claim_bad: '❌ That did not work.',
+      claim_used: '❌ This code has already been used.',
+      claim_locked: '❌ Automatic binding is disabled on this deployment.',
+      claim_private: '❌ Binding only works in a private chat with the bot.',
+      claim_wait: '⏳ Too many attempts; try again in a few minutes.',
+      owner_title: '🔐 Telegram access',
+      owner_none: 'No admin is bound yet. Use “Connect Telegram” in the web panel to mint a single-use code.',
+      owner_added: '✅ Added.',
+      owner_removed: '🗑 Access revoked.',
+      owner_rotated: '♻️ All pending codes revoked.',
+      owner_add_ask: 'Send the numeric Telegram id:',
     },
   };
   const tr = (lang, key, vars) => {
@@ -7567,12 +7702,28 @@ QV.dns = (() => {
   const userLang = async (env, chat) => (await QV.d1.Kv.get(env, 'qv:tg:lang:' + chat, null)) || QV.env.get(env, 'DEFAULT_LANG', 'fa');
   const setLang = (env, chat, lang) => QV.d1.Kv.set(env, 'qv:tg:lang:' + chat, lang === 'en' ? 'en' : 'fa', 0);
 
-  const isAdmin = async (env, chat) => {
+  /* ── authorisation ──────────────────────────────────────────────────────
+   * Three roles, checked on every privileged path:
+   *   owner  — everything, including managing other admins
+   *   admin  — everything except /admins
+   *   viewer — read-only stats
+   * The env-configured id is always an owner and can never be demoted from
+   * inside the chat.  A chat id that is not in qv_admins gets nothing, no
+   * matter how it found the bot.
+   * ─────────────────────────────────────────────────────────────────────── */
+  const roleOf = async (env, chat) => {
+    if (QV.owner) return QV.safeAsync(() => QV.owner.roleOf(env, chat), null);
     const { adminId } = cfgOf(env);
-    if (adminId && String(chat) === adminId) return true;
-    const row = await QV.d1.one(env, `SELECT 1 AS ok FROM qv_admins WHERE telegram_id = ?`, String(chat));
-    return !!row;
+    if (adminId && String(chat) === adminId) return 'owner';
+    const row = await QV.d1.one(env, `SELECT role FROM qv_admins WHERE telegram_id = ?`, String(chat));
+    return row ? (row.role || 'admin') : null;
   };
+
+  const isAdmin = async (env, chat) => {
+    const role = await roleOf(env, chat);
+    return role === 'owner' || role === 'admin';
+  };
+  const isOwner = async (env, chat) => (await roleOf(env, chat)) === 'owner';
 
   const userFor = async (env, chat) => QV.d1.one(env, `SELECT * FROM qv_users WHERE telegram_id = ? LIMIT 1`, String(chat));
 
@@ -7586,17 +7737,131 @@ QV.dns = (() => {
     if (admin) rows.push([{ text: tr(lang, 'admin_menu'), callback_data: 'qv:admin' }]);
     return kb(rows);
   };
-  const adminMenu = (lang) => kb([
-    [{ text: '📊 ' + tr(lang, 'usage'), callback_data: 'ad:stats' }, { text: '👥 Users', callback_data: 'ad:users' }],
-    [{ text: '🎭 SNI hunt', callback_data: 'ad:hunt' }, { text: '🛡 Strategy', callback_data: 'ad:strategy' }],
-    [{ text: '🧪 Self-test', callback_data: 'ad:selftest' }, { text: '🗂 Logs', callback_data: 'ad:logs' }],
-    [{ text: '📣 Broadcast', callback_data: 'ad:broadcast:ask' }, { text: '🤖 AI', callback_data: 'ad:ai' }],
-    [{ text: '💾 Backup', callback_data: 'ad:backup' }, { text: tr(lang, 'menu'), callback_data: 'qv:menu' }],
-  ]);
+  const adminMenu = (lang, owner) => {
+    const rows = [
+      [{ text: '📊 ' + tr(lang, 'usage'), callback_data: 'ad:stats' }, { text: '👥 Users', callback_data: 'ad:users' }],
+      [{ text: '🎭 SNI hunt', callback_data: 'ad:hunt' }, { text: '🛡 Strategy', callback_data: 'ad:strategy' }],
+      [{ text: '🧪 Self-test', callback_data: 'ad:selftest' }, { text: '🗂 Logs', callback_data: 'ad:logs' }],
+      [{ text: '📣 Broadcast', callback_data: 'ad:broadcast:ask' }, { text: '🤖 AI', callback_data: 'ad:ai' }],
+      [{ text: '💾 Backup', callback_data: 'ad:backup' }, { text: tr(lang, 'menu'), callback_data: 'qv:menu' }],
+    ];
+    /* only an owner manages owners — the button is not rendered for anyone else */
+    if (owner) rows.push([{ text: '🔐 ' + tr(lang, 'owner_title'), callback_data: 'ad:owner' }]);
+    return kb(rows);
+  };
+
+  /* ───────────────────── owner binding (claim flow) ─────────────────────
+   *  Everything here is deliberately uninformative to a stranger: an unknown,
+   *  expired or already-spent code produces the same neutral refusal, no
+   *  counter, no hint about how many codes are outstanding, and no chat id is
+   *  ever echoed back unmasked.  The proof of authorisation is the code, and
+   *  the code only ever exists inside an authenticated panel session.
+   * ─────────────────────────────────────────────────────────────────────── */
+  const withOwner = async (c, fn) => (c.owner ? fn() : send(c.env, c.chat, tr(c.lang, 'no_perm')));
+
+  const CLAIM_MSG = {
+    'locked': 'claim_locked', 'private-only': 'claim_private', 'identity-mismatch': 'claim_private',
+    'slow-down': 'claim_wait', 'too-many-attempts': 'claim_wait', 'already-used': 'claim_used',
+  };
+
+  const claimFrom = async (c, rawCode) => {
+    if (!QV.owner) return send(c.env, c.chat, tr(c.lang, 'claim_bad'));
+    const code = String(rawCode || '').trim().replace(/^claim[_-]?/i, '');
+    if (!code) return send(c.env, c.chat, tr(c.lang, 'claim_ask'));
+    const r = await QV.owner.redeem(c.env, c.ctx, {
+      code, chat: c.chat, user: c.fromId || c.chat, chat_type: c.chatType || 'private',
+      name: c.name || '', via: c.via || 'command',
+    });
+    if (!r.ok) {
+      /* one message for every failure mode: nothing to enumerate */
+      const key = CLAIM_MSG[r.reason] || 'claim_bad';
+      QV.emit(c.env, 'owner:claim-fail', r.reason === 'unknown-or-expired' ? 'debug' : 'warn', {
+        message: 'telegram claim refused (' + r.reason + ')', meta: { chat: QV.owner.mask(c.chat) },
+      });
+      return send(c.env, c.chat, tr(c.lang, key), userMenu(c.lang, c.admin));
+    }
+    await FSM.clear(c.env, c.chat);
+    const roleTxt = c.lang === 'en' ? r.role : (r.role === 'owner' ? 'مالک' : r.role === 'viewer' ? 'بیننده' : 'مدیر');
+    const head = r.first ? tr(c.lang, 'claim_owner') : tr(c.lang, 'claim_ok', { role: roleTxt });
+    /* tell the *other* owners — never the raw id, always the masked form */
+    if (c.ctx && c.ctx.waitUntil) {
+      c.ctx.waitUntil(notifyAdmin(c.env,
+        `🔐 <b>${r.first ? 'owner' : 'admin'}</b> ${c.lang === 'en' ? 'bound via Telegram' : 'از راه تلگرام متصل شد'}: <code>${QV.owner.mask(r.chat)}</code>\n` +
+        `${c.lang === 'en' ? 'Manage with' : 'مدیریت با'} /admins`, null, { via: 'claim', except: r.chat }).catch(() => {}));
+      /* anything that was queued while the node had no owner goes out now */
+      c.ctx.waitUntil(flushQueue(c.env).catch(() => {}));
+    }
+    const st = await QV.owner.status(c.env);
+    const en = c.lang === 'en';
+    const tail = `\n\n${en ? 'Bound' : 'متصل'}: ${st.admins.length} (${st.owners} ${en ? 'owner' : 'مالک'}) · ` +
+      `${en ? 'mode' : 'حالت'}: <code>${QV.esc(st.mode)}</code>` +
+      (st.queued_alerts ? `\n📥 ${st.queued_alerts} ${en ? 'queued alert(s) delivered' : 'هشدار در صف ارسال شد'}` : '');
+    return send(c.env, c.chat, head + tail, adminMenu(c.lang, r.role === 'owner'));
+  };
+
+  const adminsPanel = async (c) => {
+    if (!QV.owner) return send(c.env, c.chat, '—');
+    const st = await QV.owner.status(c.env);
+    const lines = [
+      '🔐 <b>' + tr(c.lang, 'owner_title') + '</b>',
+      st.locked ? '🔒 OWNER_LOCK' : (st.claimed
+        ? `${c.lang === 'en' ? 'owner' : 'مالک'}: <code>${QV.esc(st.owner || '—')}</code>`
+        : '⚠️ ' + tr(c.lang, 'owner_none')),
+      '',
+    ];
+    for (const a of st.admins) {
+      lines.push(`${a.role === 'owner' ? '👑' : a.role === 'viewer' ? '👁' : '🛡'} <code>${QV.esc(a.id)}</code> · ${QV.esc(a.role)}${a.source === 'env' ? ' · env' : ''}${a.name ? ' · ' + QV.esc(a.name) : ''}`);
+    }
+    if (st.pending_codes) lines.push('', `⏳ ${st.pending_codes} ${c.lang === 'en' ? 'pending code(s)' : 'کد در انتظار'}`);
+    if (st.queued_alerts) lines.push(`📥 ${st.queued_alerts} ${c.lang === 'en' ? 'queued alert(s)' : 'هشدار در صف'}`);
+    /* callback_data is capped at 64 bytes by Telegram, and it transits their
+       servers — so rows are addressed by the non-reversible fingerprint, never
+       by the raw chat id */
+    const rows = [];
+    for (const a of st.admins) {
+      if (a.source === 'env') continue;             // the env id cannot be removed
+      rows.push([
+        { text: `${a.role === 'owner' ? '👑' : a.role === 'viewer' ? '👁' : '🛡'} ${QV.esc(a.id)}`, callback_data: `ad:owner:role:${a.fp}:admin` },
+        { text: '🗑', callback_data: `ad:owner:del:${a.fp}` },
+      ]);
+    }
+    rows.push([{ text: '🔗 ' + (c.lang === 'en' ? 'New claim code' : 'کد اتصال جدید'), callback_data: 'ad:owner:invite' },
+               { text: '➕ ' + (c.lang === 'en' ? 'Add by id' : 'افزودن با شناسه'), callback_data: 'ad:owner:add' }]);
+    rows.push([{ text: '♻️ ' + (c.lang === 'en' ? 'Revoke codes' : 'باطل کردن کدها'), callback_data: 'ad:owner:rotate' },
+               { text: tr(c.lang, 'admin_menu'), callback_data: 'ad:menu' }]);
+    return send(c.env, c.chat, lines.join('\n'), kb(rows));
+  };
+
+  const ownerMint = async (c) => {
+    const r = await QV.owner.invite(c.env, c.ctx, { by: 'telegram:' + QV.owner.mask(c.chat), via: 'telegram' });
+    if (!r.ok) return send(c.env, c.chat, '⛔️ ' + QV.esc(r.error || ''));
+    const rows = [[{ text: '📋 ' + (c.lang === 'en' ? 'Copy code' : 'کپی کد'), callback_data: 'ad:owner:copy:' + QV.esc(r.code) }]];
+    if (r.link) rows.push([{ text: '📲 ' + (c.lang === 'en' ? 'Open in Telegram' : 'بازکردن در تلگرام'), url: r.link }]);
+    rows.push([{ text: tr(c.lang, 'owner_title'), callback_data: 'ad:owner' }]);
+    /* the plaintext exists only in this private chat and only until it expires */
+    return send(c.env, c.chat,
+      `🔑 <b>${c.lang === 'en' ? 'Single-use claim code' : 'کد یک‌بارمصرف اتصال'}</b>\n<code>${QV.esc(r.code)}</code>\n\n` +
+      (c.lang === 'en'
+        ? `Send <code>/claim ${QV.esc(r.code)}</code> in the chat you want to bind.\nExpires in ${r.ttl_min} min · stored only as an HMAC digest.`
+        : `دستور <code>/claim ${QV.esc(r.code)}</code> را در چتی که می‌خواهید متصل شود بفرستید.\nاعتبار: ${r.ttl_min} دقیقه · فقط به‌صورت چکیدهٔ HMAC ذخیره می‌شود.`),
+      kb(rows));
+  };
 
   /* ─────────────────────── command handling ───────────────────────────── */
   const COMMANDS = {
-    start: async (c) => showMenu(c, true),
+    start: async (c) => {
+      /* a deep link  https://t.me/<bot>?start=claim_CODE  arrives as
+         "/start claim_CODE" — the only place a claim is accepted from a link,
+         and it goes through exactly the same verification as /claim */
+      const payload = (c.args || []).join(' ').trim();
+      const m = payload.match(/^claim[_-]?([A-Za-z0-9-]{6,40})$/i);
+      if (m) return claimFrom(c, m[1]);
+      return showMenu(c, true);
+    },
+    claim: async (c) => claimFrom(c, (c.args || []).join(' ')),
+    bind: async (c) => claimFrom(c, (c.args || []).join(' ')),
+    admins: async (c) => withOwner(c, () => adminsPanel(c)),
+    owner: async (c) => withOwner(c, () => adminsPanel(c)),
     menu: async (c) => showMenu(c, true),
     help: async (c) => help(c),
     lang: async (c) => askLang(c),
@@ -7624,12 +7889,12 @@ QV.dns = (() => {
       const r = await broadcast(c.env, c.ctx, text, {});
       return send(c.env, c.chat, `✅ برای ${r.sent} کاربر ارسال شد${r.failed ? ` (${r.failed} ناموفق)` : ''}.`);
     }),
-    strategy: async (c) => withAdmin(c, async () => send(c.env, c.chat, '<pre>' + QV.esc(JSON.stringify(await QV.antidpi.load(c.env), null, 1)) + '</pre>', adminMenu(c.lang))),
-    sni: async (c) => withAdmin(c, async () => send(c.env, c.chat, '<pre>' + QV.esc(JSON.stringify((await QV.d1.Sni.top(c.env, 10)), null, 1)) + '</pre>', adminMenu(c.lang))),
-    hunt: async (c) => withAdmin(c, async () => { const found = await QV.antidpi.hunt(c.env, c.ctx, { count: 6 }); return send(c.env, c.chat, `🎭 ${found.length} SNI جدید:\n<pre>${QV.esc(found.map(f => f.sni + '  ' + f.score).join('\n'))}</pre>`, adminMenu(c.lang)); }),
+    strategy: async (c) => withAdmin(c, async () => send(c.env, c.chat, '<pre>' + QV.esc(JSON.stringify(await QV.antidpi.load(c.env), null, 1)) + '</pre>', adminMenu(c.lang, c.owner))),
+    sni: async (c) => withAdmin(c, async () => send(c.env, c.chat, '<pre>' + QV.esc(JSON.stringify((await QV.d1.Sni.top(c.env, 10)), null, 1)) + '</pre>', adminMenu(c.lang, c.owner))),
+    hunt: async (c) => withAdmin(c, async () => { const found = await QV.antidpi.hunt(c.env, c.ctx, { count: 6 }); return send(c.env, c.chat, `🎭 ${found.length} SNI جدید:\n<pre>${QV.esc(found.map(f => f.sni + '  ' + f.score).join('\n'))}</pre>`, adminMenu(c.lang, c.owner)); }),
     selftest: async (c) => withAdmin(c, async () => {
       const r = await QV.selfcheck.run(c.env, { quick: true });
-      return send(c.env, c.chat, `${r.ok ? '✅' : '⚠️'} <b>${r.summary}</b>` + (r.failed.length ? `\n<pre>${QV.esc(r.failed.join('\n'))}</pre>` : ''), adminMenu(c.lang));
+      return send(c.env, c.chat, `${r.ok ? '✅' : '⚠️'} <b>${r.summary}</b>` + (r.failed.length ? `\n<pre>${QV.esc(r.failed.join('\n'))}</pre>` : ''), adminMenu(c.lang, c.owner));
     }),
     ai: async (c) => withAdmin(c, async () => {
       const prompt = c.args.join(' ').trim();
@@ -7638,7 +7903,7 @@ QV.dns = (() => {
     }),
     logs: async (c) => withAdmin(c, async () => {
       const items = await QV.d1.all(c.env, `SELECT ts, type, level, message FROM qv_events ORDER BY ts DESC LIMIT 12`);
-      return send(c.env, c.chat, '<pre>' + QV.esc((items || []).map(e => `${new Date(e.ts * 1000).toISOString().slice(11, 19)} ${e.level} ${e.type}: ${e.message || ''}`).join('\n')) + '</pre>', adminMenu(c.lang));
+      return send(c.env, c.chat, '<pre>' + QV.esc((items || []).map(e => `${new Date(e.ts * 1000).toISOString().slice(11, 19)} ${e.level} ${e.type}: ${e.message || ''}`).join('\n')) + '</pre>', adminMenu(c.lang, c.owner));
     }),
     backup: async (c) => withAdmin(c, async () => {
       const snap = await QV.d1.exportAll(c.env, {});
@@ -7647,9 +7912,9 @@ QV.dns = (() => {
         await call(c.env, 'sendDocument', { chat_id: c.chat, document: undefined }); // placeholder avoided: use text if too big for a message
       }
       await QV.d1.Kv.set(c.env, 'qv:backup:last', snap, 0);
-      return send(c.env, c.chat, `💾 پشتیبان ساخته شد (${QV.humanBytes(payload.length)}) و در D1 ذخیره شد.\nاز پنل وب می‌توانید دانلود کنید.`, adminMenu(c.lang));
+      return send(c.env, c.chat, `💾 پشتیبان ساخته شد (${QV.humanBytes(payload.length)}) و در D1 ذخیره شد.\nاز پنل وب می‌توانید دانلود کنید.`, adminMenu(c.lang, c.owner));
     }),
-    whoami: async (c) => send(c.env, c.chat, `chat=<code>${c.chat}</code> admin=${c.admin}`),
+    whoami: async (c) => send(c.env, c.chat, `chat=<code>${c.chat}</code> role=${QV.esc(c.role || 'user')}`),
   };
 
   const showMenu = async (c, greet) => {
@@ -7664,9 +7929,10 @@ QV.dns = (() => {
   const help = async (c) => {
     const lang = c.lang;
     const lines = lang === 'en'
-      ? ['/start – menu', '/config – my subscription link', '/usage – traffic & quota', '/renew – buy or extend', '/support – talk to a human', '/lang – language', '/cancel – abort the current step']
-      : ['/start – منو', '/config – لینک اشتراک من', '/usage – مصرف و سهمیه', '/renew – خرید/تمدید', '/support – گفتگو با پشتیبانی', '/lang – زبان', '/cancel – لغو مرحله فعلی'];
+      ? ['/start – menu', '/config – my subscription link', '/usage – traffic & quota', '/renew – buy or extend', '/support – talk to a human', '/lang – language', '/claim <CODE> – bind this chat as an admin', '/cancel – abort the current step']
+      : ['/start – منو', '/config – لینک اشتراک من', '/usage – مصرف و سهمیه', '/renew – خرید/تمدید', '/support – گفتگو با پشتیبانی', '/lang – زبان', '/claim <CODE> – اتصال این چت به‌عنوان مدیر', '/cancel – لغو مرحله فعلی'];
     if (c.admin) lines.push('', lang === 'en' ? '<b>admin</b>: /stats /users /find /add /quota /kill /revive /broadcast /strategy /hunt /selftest /ai /logs /backup' : '<b>مدیر</b>: /stats /users /find /add /quota /kill /revive /broadcast /strategy /hunt /selftest /ai /logs /backup');
+    if (c.owner) lines.push(lang === 'en' ? '<b>owner</b>: /admins – bind, list and revoke Telegram access' : '<b>مالک</b>: /admins – اتصال، فهرست و لغو دسترسی تلگرام');
     return send(c.env, c.chat, lines.join('\n'), userMenu(lang, c.admin));
   };
   const askLang = (c) => send(c.env, c.chat, '🌐 Language / زبان', kb([[{ text: '🇮🇷 فارسی', callback_data: 'lg:fa' }, { text: '🇬🇧 English', callback_data: 'lg:en' }]]));
@@ -7707,14 +7973,14 @@ QV.dns = (() => {
       `📈 24h: ${QV.humanBytes(s.bytes_24h)} · ${c.lang === 'en' ? 'total' : 'کل'}: ${QV.humanBytes(s.bytes_total)}`,
       `🎭 SNI ${s.sni_count} · 🌐 IP ${s.ip_count}`,
       `🛡 ${QV.esc(JSON.stringify(s.strategy && s.strategy.fragment))}`,
-    ].join('\n'), adminMenu(c.lang));
+    ].join('\n'), adminMenu(c.lang, c.owner));
   };
 
   const adminUsers = async (c) => {
     const items = await QV.d1.all(c.env, `SELECT uuid, name, used_bytes, quota_bytes, killswitch FROM qv_users ORDER BY created_at DESC LIMIT 15`);
-    if (!items || !items.length) return send(c.env, c.chat, '—', adminMenu(c.lang));
+    if (!items || !items.length) return send(c.env, c.chat, '—', adminMenu(c.lang, c.owner));
     const lines = items.map(u => `${u.killswitch ? '⛔️' : '✅'} ${QV.esc(u.name || '')} <code>${u.uuid.slice(0, 8)}</code> ${QV.humanBytes(u.used_bytes)}/${QV.humanBytes(u.quota_bytes)}`);
-    return send(c.env, c.chat, lines.join('\n'), adminMenu(c.lang));
+    return send(c.env, c.chat, lines.join('\n'), adminMenu(c.lang, c.owner));
   };
 
   const adminFind = async (c, q) => {
@@ -7754,7 +8020,7 @@ QV.dns = (() => {
       await QV.d1.Users.patch(c.env, u.uuid, { quota_bytes: bytes });
       await QV.d1.Kv.set(c.env, 'qv:revive:' + u.uuid, true, 86400 * 7);
     }
-    return send(c.env, c.chat, `✅ سهمیه ${users.length} کاربر روی ${m[2]} گیگ تنظیم شد.`, adminMenu(c.lang));
+    return send(c.env, c.chat, `✅ سهمیه ${users.length} کاربر روی ${m[2]} گیگ تنظیم شد.`, adminMenu(c.lang, c.owner));
   };
 
   const killSwitch = async (c, on) => {
@@ -7766,7 +8032,7 @@ QV.dns = (() => {
       await QV.d1.Users.setKill(c.env, u.uuid, on, 'telegram');
       if (!on) await QV.d1.Kv.set(c.env, 'qv:revive:' + u.uuid, true, 86400 * 7);
     }
-    return send(c.env, c.chat, `✅ ${users.length} کاربر ${on ? 'قطع' : 'فعال'} شد.`, adminMenu(c.lang));
+    return send(c.env, c.chat, `✅ ${users.length} کاربر ${on ? 'قطع' : 'فعال'} شد.`, adminMenu(c.lang, c.owner));
   };
 
   const aiReply = async (c, prompt) => {
@@ -7782,9 +8048,9 @@ Otherwise reply with plain text only. Be concise and technical.`;
     try { const m = String(raw).match(/\{[\s\S]*\}/); if (m) action = JSON.parse(m[0]); } catch (e) {}
     if (action && action.action) {
       const r = await runCopilotAction(c, action);
-      return send(c.env, c.chat, `🤖 <b>${QV.esc(action.action)}</b>\n${QV.esc(r.note || '')}\n<pre>${QV.esc(JSON.stringify(r.data || {}, null, 1)).slice(0, 1500)}</pre>`, adminMenu(c.lang));
+      return send(c.env, c.chat, `🤖 <b>${QV.esc(action.action)}</b>\n${QV.esc(r.note || '')}\n<pre>${QV.esc(JSON.stringify(r.data || {}, null, 1)).slice(0, 1500)}</pre>`, adminMenu(c.lang, c.owner));
     }
-    return send(c.env, c.chat, '🤖 ' + QV.esc(String(raw).slice(0, 3500)), adminMenu(c.lang));
+    return send(c.env, c.chat, '🤖 ' + QV.esc(String(raw).slice(0, 3500)), adminMenu(c.lang, c.owner));
   };
 
   const runCopilotAction = async (c, a) => {
@@ -7848,7 +8114,7 @@ Otherwise reply with plain text only. Be concise and technical.`;
       if (act === 'help') return help(c);
       if (act === 'lang') return askLang(c);
       if (act === 'request') { await FSM.set(c.env, c.chat, 'request'); return send(c.env, c.chat, tr(c.lang, 'ask_name'), kb([[{ text: tr(c.lang, 'cancel'), callback_data: 'qv:cancel' }]])); }
-      if (act === 'admin') return withAdmin(c, () => send(c.env, c.chat, tr(c.lang, 'admin_menu'), adminMenu(c.lang)));
+      if (act === 'admin') return withAdmin(c, () => send(c.env, c.chat, tr(c.lang, 'admin_menu'), adminMenu(c.lang, c.owner)));
       if (act === 'approve' || act === 'reject') return approveUser(c, rest[1], act === 'approve');
       return;
     }
@@ -7856,6 +8122,32 @@ Otherwise reply with plain text only. Be concise and technical.`;
       await answer(c.env, c.cb.id, '');
       if (!c.admin) return send(c.env, c.chat, tr(c.lang, 'no_perm'));
       const act = rest[0], arg = rest[1], flag = rest[2];
+      if (act === 'menu') return send(c.env, c.chat, tr(c.lang, 'admin_menu'), adminMenu(c.lang, c.owner));
+      /* owner-only namespace: managing who may manage the node */
+      if (act === 'owner') {
+        if (!c.owner) return send(c.env, c.chat, tr(c.lang, 'no_perm'));
+        const sub = rest[1];
+        if (!sub) return adminsPanel(c);
+        if (sub === 'invite') return ownerMint(c);
+        if (sub === 'rotate') {
+          const r = await QV.owner.rotate(c.env, c.ctx);
+          await send(c.env, c.chat, `♻️ ${r.revoked} ${tr(c.lang, 'owner_rotated')}`);
+          return adminsPanel(c);
+        }
+        if (sub === 'add') { await FSM.set(c.env, c.chat, 'ad:owner:add'); return send(c.env, c.chat, tr(c.lang, 'owner_add_ask') + '\n<code>123456789 admin</code>', kb([[{ text: tr(c.lang, 'cancel'), callback_data: 'qv:cancel' }]])); }
+        if (sub === 'copy') return send(c.env, c.chat, `<code>${QV.esc(rest.slice(2).join(':'))}</code>`);
+        if (sub === 'del' || sub === 'role') {
+          /* `arg` is the non-reversible fingerprint, resolved back to the row */
+          const row = await QV.owner.byFp(c.env, arg);
+          if (!row) { await send(c.env, c.chat, '∅'); return adminsPanel(c); }
+          const r = sub === 'del'
+            ? await QV.owner.remove(c.env, c.ctx, row.telegram_id)
+            : await QV.owner.add(c.env, c.ctx, row.telegram_id, flag || 'admin', row.name);
+          await send(c.env, c.chat, r.ok ? tr(c.lang, sub === 'del' ? 'owner_removed' : 'owner_added') : '⛔️ ' + QV.esc(r.error || ''));
+          return adminsPanel(c);
+        }
+        return adminsPanel(c);
+      }
       if (act === 'stats') return adminStats(c);
       if (act === 'users') return adminUsers(c);
       if (act === 'hunt') return COMMANDS.hunt(c);
@@ -7924,6 +8216,15 @@ Otherwise reply with plain text only. Be concise and technical.`;
         return send(c.env, c.chat, tr(c.lang, 'support_sent'), userMenu(c.lang, c.admin));
       }
       case 'ad:add': return withAdmin(c, () => addUser({ ...c, args: text.split(/\s+/) }));
+      case 'ad:owner:add': return withOwner(c, async () => {
+        await FSM.clear(c.env, c.chat);
+        /* "<id> [role] [name]" — the role defaults to admin, viewer is read-only */
+        const [id, role, ...rest2] = text.trim().split(/\s+/);
+        if (!/^-?\d{3,20}$/.test(String(id || ''))) { await send(c.env, c.chat, '⛔️ ' + tr(c.lang, 'owner_add_ask')); return adminsPanel(c); }
+        const r = await QV.owner.add(c.env, c.ctx, id, role || 'admin', rest2.join(' '));
+        await send(c.env, c.chat, r.ok ? tr(c.lang, 'owner_added') : '⛔️ ' + QV.esc(r.error || ''));
+        return adminsPanel(c);
+      });
       case 'ad:quota': return withAdmin(c, () => quotaCmd({ ...c, args: text.split(/\s+/) }));
       case 'ad:find': return withAdmin(c, async () => { await FSM.clear(c.env, c.chat); return adminFind(c, text.trim()); });
       case 'ad:broadcast': return withAdmin(c, async () => { await FSM.clear(c.env, c.chat); const r = await broadcast(c.env, c.ctx, text, {}); return send(c.env, c.chat, `📣 ${r.sent} ok / ${r.failed} failed`); });
@@ -7936,6 +8237,8 @@ Otherwise reply with plain text only. Be concise and technical.`;
   };
 
   /* ─────────────────────────── update entry ───────────────────────────── */
+  const masked = (id) => (QV.owner ? QV.owner.mask(id) : String(id || '').slice(-4));
+
   const processUpdate = async (update, env, ctx, origin) => {
     const msg = update.message || update.edited_message || update.channel_post;
     const cb = update.callback_query;
@@ -7946,26 +8249,40 @@ Otherwise reply with plain text only. Be concise and technical.`;
     if (await QV.d1.Kv.get(env, seenKey, false)) return;
     await QV.d1.Kv.set(env, seenKey, true, 300);
     const bucket = QV.tokenBucket('tg:' + chat, 40, 8);
-    if (!bucket.take()) { QV.log.warn('telegram', 'rate limited', { chat }); return; }
+    if (!bucket.take()) { QV.log.warn('telegram', 'rate limited', { chat: masked(chat) }); return; }
     const lang = await userLang(env, chat);
-    const admin = await isAdmin(env, chat);
+    const role = await roleOf(env, chat);
+    /* the sender, which in a group is NOT the chat: the claim flow insists on
+       from.id === chat.id so nobody can bind a channel or a group they do not
+       own, and nobody can ride somebody else's private chat */
+    const from = (cb && cb.from && cb.from.id) || (msg && msg.from && msg.from.id) || '';
+    const chatType = (msg && msg.chat && msg.chat.type) || (cb && cb.message && cb.message.chat && cb.message.chat.type) || '';
     const c = {
-      env, ctx, chat, lang, admin, origin: origin || '',
-      name: (msg && msg.from && (msg.from.first_name || msg.from.username)) || '',
+      env, ctx, chat, lang, origin: origin || '',
+      role: role || 'user',
+      admin: role === 'owner' || role === 'admin',
+      owner: role === 'owner',
+      fromId: String(from || ''), chatType,
+      name: (msg && msg.from && (msg.from.first_name || msg.from.username)) ||
+            (cb && cb.from && (cb.from.first_name || cb.from.username)) || '',
       ok: (d) => d,
     };
     try {
       if (cb) return await onCallback({ ...c, cb, data: cb.data, messageId: cb.message && cb.message.message_id });
       if (msg && msg.text) {
-        if (/^\/start\b/.test(msg.text) || /^\/menu\b/.test(msg.text) || msg.text === '/start') return await COMMANDS.start({ ...c, args: [] });
-        return await onText({ ...c, text: msg.text, args: msg.text.replace(/^\//, '').split(/\s+/).slice(1) }, msg.text);
+        const text = String(msg.text);
+        /* "/start <payload>" carries the deep-link argument (claim_…) */
+        if (/^\/(start|menu)(@[\w-]+)?\b/i.test(text)) {
+          return await COMMANDS.start({ ...c, args: text.split(/\s+/).slice(1) });
+        }
+        return await onText({ ...c, text, args: text.replace(/^\//, '').split(/\s+/).slice(1) }, text);
       }
       if (msg && (msg.photo || msg.document)) {
-        await notifyAdmin(env, `📎 <b>رسید/فایل</b> از <code>${chat}</code>`);
+        await notifyAdmin(env, `📎 <b>رسید/فایل</b> از <code>${masked(chat)}</code>`);
         return send(env, chat, tr(lang, 'requested'));
       }
     } catch (e) {
-      QV.log.error('telegram', 'update failed', { err: e?.message, stack: String(e?.stack || '').slice(0, 400), chat });
+      QV.log.error('telegram', 'update failed', { err: e?.message, stack: String(e?.stack || '').slice(0, 400), chat: masked(chat) });
       QV.emit(env, 'tg:error', 'error', { message: e?.message, ctx });
     }
   };
@@ -7979,7 +8296,7 @@ Otherwise reply with plain text only. Be concise and technical.`;
   };
 
   const ensureWebhook = async (env, ctx, origin) => {
-    const { token, adminId } = cfgOf(env);
+    const { token } = cfgOf(env);
     if (!token) return { ok: false, error: 'TELEGRAM_BOT_TOKEN is not configured' };
     const base = (env.CUSTOM_DOMAIN ? 'https://' + env.CUSTOM_DOMAIN : origin);
     const url = base.replace(/\/$/, '') + '/tg/webhook';
@@ -7989,21 +8306,33 @@ Otherwise reply with plain text only. Be concise and technical.`;
       allowed_updates: ['message', 'callback_query', 'edited_message', 'channel_post'],
     });
     const me = await call(env, 'getMe');
-    if (adminId) await send(env, adminId, `✅ Webhook روی <code>${QV.esc(url)}</code> تنظیم شد.${me.ok ? `\n@${QV.esc(me.result.username)}` : ''}`);
+    /* remember @username so the claim deep link can be built without another
+       round-trip to the Telegram API (and without TELEGRAM_BOT_USERNAME) */
+    if (me.ok && me.result && me.result.username) {
+      await QV.safeAsync(() => QV.d1.Kv.set(env, 'qv:tg:bot', String(me.result.username), 0), null);
+    }
+    /* goes to every bound owner/admin; if nobody is bound yet it is queued and
+       delivered the moment the bot is claimed — nothing is lost */
+    await notifyAdmin(env, `✅ Webhook روی <code>${QV.esc(url)}</code> تنظیم شد.${me.ok && me.result ? `\n@${QV.esc(me.result.username)}` : ''}`);
     QV.emit(env, 'tg:webhook', 'info', { message: 'webhook set: ' + url, ctx });
-    return { ok: r.ok, url, secret_fingerprint: secret_token.slice(0, 8), error: r.error };
+    return { ok: r.ok, url, bot: me.ok && me.result ? me.result.username : null, secret_fingerprint: secret_token.slice(0, 8), error: r.error };
   };
 
   const deleteWebhook = async (env) => call(env, 'deleteWebhook', { drop_pending_updates: false });
   const status = async (env) => {
     const me = await call(env, 'getMe');
     const info = await call(env, 'getWebhookInfo');
-    const { adminId } = cfgOf(env);
     const secret = await secretFor(env);
+    /* chat ids are personal data about the operator: /health, the panel and
+       every log line only ever see the masked form plus the owner block */
+    const owner = QV.owner ? await QV.safeAsync(() => QV.owner.status(env), null) : null;
     return {
       configured: !!cfgOf(env).token, bot: me.ok ? me.result.username : null,
       secret_fingerprint: secret.slice(0, 8),
-      admin_id: adminId || null, webhook: info.ok ? info.result : info.error,
+      admin_id: owner ? owner.owner : (cfgOf(env).adminId ? masked(cfgOf(env).adminId) : null),
+      admins: owner ? owner.admins.length : 0,
+      owner: owner || { claimed: !!cfgOf(env).adminId, mode: cfgOf(env).adminId ? 'env-only' : 'unknown' },
+      webhook: info.ok ? info.result : info.error,
       mode: env.DISABLE_WEBHOOK ? 'polling' : 'webhook+fallback',
     };
   };
@@ -8065,14 +8394,493 @@ Otherwise reply with plain text only. Be concise and technical.`;
   QV.telegram = {
     call, send, edit, answer, notifyAdmin, kb,
     handleWebhook, ensureWebhook, deleteWebhook, status, pollOnce, processUpdate,
-    broadcast, FSM, tr, setLang, userLang, isAdmin, userFor, secretFor,
+    broadcast, FSM, tr, setLang, userLang, isAdmin, isOwner, roleOf, userFor, secretFor,
+    /* owner binding: the chat side of 31-owner.js */
+    recipients, flushQueue, claimFrom, adminsPanel, ownerMint,
     commands: Object.keys(COMMANDS),
-    /** push a message to every admin (used by QV.emit for critical events) */
-    alert: async (env, text, keyboard) => notifyAdmin(env, '⚠️ ' + text, keyboard),
+    /** push an alert to every bound owner/admin, deduplicated per hour */
+    alert,
   };
 
   /* the compatibility layer calls the historic name with (env, url) */
   QV.telegram.setWebhook = QV.telegram.setWebhook || ((env, url, ctx) => ensureWebhook(env, ctx, url));
+})();
+
+
+/* ═══════════ 31-owner.js ═══════════ */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * A3b · OWNER BINDING — the bot is claimed, never configured
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  Problem: the Telegram control plane used to need `ADMIN_TELEGRAM_ID`, a value
+ *  that has to be typed by hand, kept out of the repository and rotated by hand
+ *  whenever the operator changes device.  While it is missing, every alert,
+ *  every approval request and every support ping is silently dropped, and half
+ *  of the admin commands answer “ADMIN_TELEGRAM_ID not set”.
+ *
+ *  Design: the owner is DISCOVERED, not configured.
+ *
+ *    1. `ADMIN_TELEGRAM_ID` stays supported and keeps the highest priority — an
+ *       operator who already set it sees exactly zero change.
+ *    2. When it is absent, whoever can already authenticate against the panel
+ *       (ADMIN_PASSWORD session, API_SECRET_TOKEN or Cloudflare Access) mints a
+ *       single-use *claim code*:  POST /api/owner {action:'invite'}, or the
+ *       “connect Telegram” button in the console.
+ *    3. The operator opens the deep link  https://t.me/<bot>?start=claim_CODE
+ *       or sends `/claim CODE` in a private chat.  Nothing is shown to a
+ *       stranger: a wrong or unknown code gets a neutral refusal, never a hint.
+ *    4. The code is verified in constant time against an HMAC-SHA256 digest, so
+ *       the plaintext is never stored anywhere (not in D1, not in a log).
+ *       Consumption is atomic: a primary-key INSERT decides the winner, so two
+ *       isolates racing on the same code can never both succeed.
+ *    5. The winning chat id is written to `qv_admins` with role='owner' and the
+ *       whole control plane then resolves its recipients from D1 — alerts,
+ *       approvals, support, broadcasts and the admin menus all work with no
+ *       environment variable at all.
+ *
+ *  Hard rules (why this is safe rather than merely convenient):
+ *   · a chat is NEVER auto-promoted for messaging first; the code is the proof;
+ *   · claiming is only possible in a private chat where from.id === chat.id;
+ *   · codes expire (default 30 min), are single-use, and a new invite revokes
+ *     none of the old ones but `rotate` does — all of them, instantly;
+ *   · roles are checked on every privileged path: owner > admin > viewer;
+ *   · the env-configured id can never be demoted or locked out from the chat;
+ *   · the owner's chat id is never echoed into logs, /health or HTML — only a
+ *     masked form (…1234) ever leaves D1, and only over an admin session;
+ *   · if no recipient exists yet, alerts are queued in D1 instead of being
+ *     dropped, and flushed to the owner the moment the bot is claimed;
+ *   · `OWNER_LOCK=1` disables claiming completely (env id only).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+(function owner() {
+  /* unambiguous alphabet: no I/L/O/0/1 — a code read out loud or copied from a
+     screenshot cannot be mistyped into another valid code */
+  const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  const GROUPS = 2, GROUP = 5;                 // 10 chars ≈ 49.5 bits of entropy
+  const RETRY_WINDOW = 600;                    // 10 min
+
+  const get = (env, key, dflt) => {
+    try {
+      if (QV.env && QV.env.get) {
+        const v = QV.env.get(env, key, undefined);
+        if (v !== undefined && v !== null && v !== '') return v;
+      }
+    } catch (e) { /* fall through to the raw binding */ }
+    try {
+      const v = env && env[key];
+      return (v === undefined || v === null || v === '') ? dflt : v;
+    } catch (e) { return dflt; }
+  };
+
+  const num = (env, key, dflt, lo, hi) => {
+    const n = Number(get(env, key, dflt));
+    const v = Number.isFinite(n) ? n : dflt;
+    return Math.min(hi === undefined ? v : hi, Math.max(lo === undefined ? v : lo, v));
+  };
+  const on = (env, key, dflt = false) => {
+    const v = String(get(env, key, dflt ? '1' : '0')).toLowerCase();
+    return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+  };
+
+  const locked = (env) => on(env, 'OWNER_LOCK', false);
+  const mask = (id) => {
+    const s = String(id || '');
+    if (!s) return null;
+    return s.length <= 4 ? '•' + s : '•'.repeat(Math.max(2, s.length - 4)) + s.slice(-4);
+  };
+  const digits = (v) => String(v || '').split(/[\s,;]+/).map(s => s.trim()).filter(s => /^-?\d{3,20}$/.test(s));
+  const num0 = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
+  /** env-configured admins — always trusted, never written by the claim flow */
+  const envIds = (env) => digits(get(env, 'ADMIN_TELEGRAM_ID', '') || get(env, 'ADMIN_CHAT_ID', ''));
+
+  /* ── the pepper: committed once, stable for the life of the database ─────
+   *  Everything the claim flow stores or transports is an HMAC under this value
+   *  — the code digests in D1, and the id fingerprints that travel inside
+   *  Telegram callback payloads and console buttons — so it has to be identical
+   *  in every isolate *and* identical after a redeploy.
+   *
+   *  The ladder is: an explicit OWNER_PEPPER → the pepper already committed to
+   *  this database → one derived from the deployment's own secrets → a minted
+   *  one.  Reading the committed value *before* deriving is the whole point:
+   *  deriving from live secrets means that rotating ADMIN_PASSWORD, the bot
+   *  token or the API token silently re-keys every fingerprint, and from that
+   *  moment `byFp` resolves nothing — the "revoke" and "role" buttons in
+   *  Telegram and in the console keep rendering but stop working, with no error
+   *  anywhere.  One committed row removes that failure mode entirely.
+   *
+   *  Is keeping it in D1 safe?  `qv_admins` already holds the raw chat ids, so
+   *  anybody who can read this database learns nothing new from the key that
+   *  protects them.  What the pepper defends is the data that *leaves* D1
+   *  (callbacks, JSON, logs), and for anybody without the database those stay
+   *  exactly as one-way as before.
+   *
+   *  Committing is `INSERT … ON CONFLICT DO NOTHING` plus a re-read, so two
+   *  isolates booting at the same moment converge on one value instead of each
+   *  keeping its own.
+   * ──────────────────────────────────────────────────────────────────────── */
+  const PEPPER_KEY = 'qv:owner:pepper';
+  const isPepper = (v) => /^[0-9a-f]{32,128}$/i.test(String(v || ''));
+  const pepperCache = new Map();
+
+  const readPepper = async (env) => {
+    const v = await QV.safeAsync(() => QV.d1.Kv.get(env, PEPPER_KEY, null), null);
+    return isPepper(v) ? String(v) : '';
+  };
+  const commitPepper = async (env, candidate) => {
+    if (!env || !env.DB) return candidate;         // nowhere to commit to
+    await QV.safeAsync(() => QV.d1.run(env,
+      `INSERT INTO qv_kv (key,value,expires_at) VALUES (?,?,NULL) ON CONFLICT(key) DO NOTHING`,
+      PEPPER_KEY, JSON.stringify(candidate)), null);
+    QV.lru.delete('kv:' + PEPPER_KEY);             // re-read the winner, not our guess
+    return (await readPepper(env)) || candidate;
+  };
+  const derive = async (material) =>
+    QV.hex(await QV.hmacSha256(QV.utf8('qv-owner-pepper-v1'), QV.utf8(material)));
+
+  const pepperOf = async (env) => {
+    const explicit = String(get(env, 'OWNER_PEPPER', '') || '');
+    if (explicit) return explicit;                 // operator-pinned: never stored
+    if (pepperCache.has('p')) return pepperCache.get('p');
+    /* only memoise once the value is durable — an uncommitted candidate from a
+       request that raced the schema must not stick for the life of the isolate */
+    const keep = (p) => { if (env && env.DB) pepperCache.set('p', p); return p; };
+
+    const committed = await readPepper(env);
+    if (committed) return keep(committed);
+
+    const fromEnv = [
+      get(env, 'TELEGRAM_WEBHOOK_SECRET', ''), get(env, 'TELEGRAM_BOT_TOKEN', ''),
+      get(env, 'JWT_SECRET', ''), get(env, 'API_SECRET_TOKEN', ''), get(env, 'ADMIN_PASSWORD', ''),
+    ].map(v => String(v || '')).join('|');
+    if (fromEnv.replace(/\|/g, '')) return keep(await commitPepper(env, await derive(fromEnv)));
+
+    /* nothing configured: fall back to the credentials the env module already
+       generated and persisted, which are stable for the life of the database */
+    const sec = await QV.safeAsync(() => QV.env.secrets(env, null), null);
+    const fromStore = [sec?.jwt, sec?.api, sec?.bridge, sec?.adminPassword].map(v => String(v || '')).join('|');
+    if (fromStore.replace(/\|/g, '')) return keep(await commitPepper(env, await derive(fromStore)));
+
+    return keep(await commitPepper(env, QV.hex(QV.rand(24))));
+  };
+
+  /** diagnostics only — never the value itself */
+  const pepperSource = async (env) => {
+    if (String(get(env, 'OWNER_PEPPER', '') || '')) return 'env';
+    if (await readPepper(env)) return 'd1';
+    return (env && env.DB) ? 'derived' : 'ephemeral';
+  };
+
+  const normalize = (code) => String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  /** keyed digest under the deployment pepper — the only place a raw value is
+      ever turned into something storable or transportable */
+  const tag = async (env, msg) => QV.hex(await QV.hmacSha256(QV.utf8(await pepperOf(env)), QV.utf8(String(msg))));
+  const digestOf = async (env, code) => tag(env, 'claim:' + normalize(code));
+  /** short, stable, non-reversible handle for a chat id — safe to put inside a
+      Telegram callback payload, because it cannot be turned back into the id */
+  const fpOf = async (env, id) => (await tag(env, 'id:' + String(id))).slice(0, 12);
+  const newCode = () => {
+    const bytes = QV.rand(GROUPS * GROUP);
+    let out = '';
+    for (let i = 0; i < bytes.length; i++) out += ALPHABET[bytes[i] % ALPHABET.length];
+    return out.match(new RegExp('.{1,' + GROUP + '}', 'g')).join('-');
+  };
+
+  /* ── recipients ───────────────────────────────────────────────────────── */
+  const rowsOf = async (env) => QV.safeAsync(
+    () => QV.d1.all(env, `SELECT telegram_id, name, role, added_at FROM qv_admins ORDER BY added_at ASC LIMIT 200`), []) || [];
+
+  /** every chat that may command the node: env ids first (owner), then D1 rows */
+  const resolve = async (env) => {
+    const envList = envIds(env);
+    const rows = await rowsOf(env);
+    const seen = new Set();
+    const admins = [];
+    const owners = [];
+    for (const id of envList) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      owners.push({ telegram_id: id, role: 'owner', source: 'env', name: 'env' });
+      admins.push({ telegram_id: id, role: 'owner', source: 'env', name: 'env' });
+    }
+    for (const r of rows) {
+      const id = String(r.telegram_id || '');
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const role = envList.length && r.role === 'owner' ? 'admin' : (r.role || 'admin');
+      admins.push({ telegram_id: id, role, source: 'd1', name: r.name || '', added_at: r.added_at });
+      if (role === 'owner') owners.push({ telegram_id: id, role, source: 'd1', name: r.name || '' });
+    }
+    return { env: envList, admins, owners, ids: admins.map(a => a.telegram_id), owner: owners[0] || null };
+  };
+
+  const recipientIds = async (env) => (await resolve(env)).ids;
+  /** resolve a callback-payload fingerprint back to a qv_admins row */
+  const byFp = async (env, needle) => {
+    const want = String(needle || '');
+    if (!/^[0-9a-f]{6,16}$/i.test(want)) return null;
+    for (const r of await rowsOf(env)) if ((await fpOf(env, r.telegram_id)) === want.toLowerCase()) return r;
+    return null;
+  };
+  /** a caller may address an admin either by raw numeric id (owner typing it in)
+      or by fingerprint (a button in Telegram or the console, which must never
+      carry the real id) — both resolve to the same row */
+  const resolveTarget = async (env, target) => {
+    const s = String(target || '').trim();
+    if (/^-?\d{3,20}$/.test(s)) return s;
+    if (/^[0-9a-f]{6,16}$/i.test(s)) {
+      const row = await byFp(env, s);
+      return row ? String(row.telegram_id) : null;
+    }
+    return null;
+  };
+  const roleOf = async (env, chat) => {
+    const id = String(chat || '');
+    if (!id) return null;
+    if (envIds(env).includes(id)) return 'owner';
+    const row = await QV.safeAsync(() => QV.d1.one(env, `SELECT role FROM qv_admins WHERE telegram_id = ? LIMIT 1`, id), null);
+    return row ? (row.role || 'admin') : null;
+  };
+  const isAdmin = async (env, chat) => {
+    const role = await roleOf(env, chat);
+    return role === 'owner' || role === 'admin';
+  };
+  const unclaimed = async (env) => {
+    if (envIds(env).length) return false;
+    const row = await QV.safeAsync(() => QV.d1.one(env, `SELECT 1 AS ok FROM qv_admins WHERE role = 'owner' LIMIT 1`), null);
+    return !row;
+  };
+
+  /* ── the queue that keeps early alerts from being lost ─────────────────── */
+  const queueAlert = async (env, text) => {
+    const max = num(env, 'OWNER_NOTIFY_QUEUE', 50, 0, 200);
+    if (!max) return { queued: 0 };
+    const list = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:queue', []), []) || [];
+    const next = (Array.isArray(list) ? list : []).concat([{ text: String(text || '').slice(0, 1200), at: Date.now() }]).slice(-max);
+    await QV.safeAsync(() => QV.d1.Kv.set(env, 'qv:owner:queue', next, 86400 * 30), null);
+    return { queued: next.length };
+  };
+  const drainQueue = async (env) => {
+    const list = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:queue', []), []) || [];
+    if (Array.isArray(list) && list.length) await QV.safeAsync(() => QV.d1.Kv.del(env, 'qv:owner:queue'), null);
+    return Array.isArray(list) ? list : [];
+  };
+  /** draining is not acknowledgement: an item that could not be handed to
+      Telegram (429, network, an owner removed mid-flush) goes back on the
+      queue, oldest first — but only up to OWNER_NOTIFY_TRIES attempts, so a
+      permanently broken destination cannot pin the queue forever */
+  const requeueAlerts = async (env, items) => {
+    const max = num(env, 'OWNER_NOTIFY_QUEUE', 50, 0, 200);
+    const limit = num(env, 'OWNER_NOTIFY_TRIES', 5, 1, 50);
+    const back = [];
+    let dropped = 0;
+    for (const it of (Array.isArray(items) ? items : [])) {
+      if (!it) continue;
+      const text = String(it.text || (typeof it === 'string' ? it : '')).slice(0, 1200);
+      if (!text) continue;
+      const tries = Number(it.tries || 0) + 1;
+      if (tries > limit) { dropped++; continue; }
+      back.push({ text, at: Number(it.at) || Date.now(), tries });
+    }
+    if (!back.length) return { queued: 0, dropped };
+    if (!max) return { queued: 0, dropped: dropped + back.length };
+    const cur = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:queue', []), []) || [];
+    const merged = back.concat(Array.isArray(cur) ? cur : []).slice(-max);
+    await QV.safeAsync(() => QV.d1.Kv.set(env, 'qv:owner:queue', merged, 86400 * 30), null);
+    return { queued: merged.length, dropped };
+  };
+  const queueLen = async (env) => {
+    const list = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:queue', []), []) || [];
+    return Array.isArray(list) ? list.length : 0;
+  };
+
+  /* ── invite / claim / manage ──────────────────────────────────────────── */
+  const deepLink = async (env, code) => {
+    const uname = String(await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:tg:bot', ''), '') || '').replace(/^@/, '');
+    return uname ? `https://t.me/${uname}?start=claim_${normalize(code)}` : null;
+  };
+
+  const invite = async (env, ctx, opts = {}) => {
+    if (locked(env)) return { ok: false, error: 'owner binding is locked (OWNER_LOCK=1)' };
+    const ttlMin = num(env, 'OWNER_CLAIM_TTL_MIN', opts.ttl_min || 30, 1, 1440);
+    const code = newCode();
+    const ttl = ttlMin * 60;
+    const digest = await digestOf(env, code);
+    const fp = digest.slice(0, 12);
+    const now = Math.floor(Date.now() / 1000);
+    const rec = { fp, digest, at: now, exp: now + ttl, ttl, by: String(opts.by || 'panel').slice(0, 40), via: String(opts.via || 'panel') };
+    await QV.d1.Kv.set(env, 'qv:owner:claim:' + fp, rec, ttl);
+    QV.emit(env, 'owner:invite', 'info', { message: `owner claim code minted (${ttlMin}m, ${rec.by})`, ctx });
+    return {
+      ok: true, code, fingerprint: fp, expires_at: rec.exp, ttl_min: ttlMin,
+      link: await deepLink(env, code),
+      note: 'single use · expires in ' + ttlMin + ' minutes · plaintext is never stored',
+    };
+  };
+
+  const deny = (reason, extra = {}) => ({ ok: false, reason, ...extra });
+
+  const redeem = async (env, ctx, o = {}) => {
+    const chat = String(o.chat || '');
+    const from = String(o.user || o.from || chat);
+    if (!chat) return deny('no-chat');
+    if (locked(env)) return deny('locked');
+    if (o.chat_type && o.chat_type !== 'private') return deny('private-only');
+    if (from && chat && from !== chat) return deny('identity-mismatch');
+    const bucket = QV.tokenBucket('owner:redeem:' + chat, 6, 3);
+    if (!bucket.take()) return deny('slow-down');
+    const raw = String(o.code || '').trim();
+    if (normalize(raw).length < 6 || normalize(raw).length > 32) return deny('bad-format');
+    const fails = num0(await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:fail:' + chat, 0), 0));
+    if (fails >= 12) return deny('too-many-attempts', { retry_after: RETRY_WINDOW });
+    const digest = await digestOf(env, raw);
+    const fp = digest.slice(0, 12);
+    /* replay gate first: the marker is what makes a claim atomic */
+    const used = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:claim:used:' + fp, null), null);
+    if (used) return deny('already-used');
+    const rec = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:claim:' + fp, null), null);
+    if (!rec || !rec.digest) {
+      await bumpFail(env, chat);
+      return deny('unknown-or-expired');
+    }
+    if (Number(rec.exp) && Number(rec.exp) * 1000 < Date.now()) return deny('expired');
+    if (!QV.timingSafeEqual(digest, String(rec.digest))) {
+      await bumpFail(env, chat);
+      return deny('unknown-or-expired');
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const claim = await QV.d1.run(env,
+      'INSERT OR IGNORE INTO qv_kv (key,value,expires_at) VALUES (?,?,?)',
+      'qv:owner:claim:used:' + fp,
+      JSON.stringify({ chat: mask(chat), at: now * 1000, fp }), now + 86400 * 30);
+    const changes = claim && claim.meta ? Number(claim.meta.changes || 0) : Number(claim && claim.changes || 0);
+    if (changes !== 1) return deny('already-used');
+    /* first claim wins the owner role; later ones are promoted to plain admin,
+       and a race that somehow produced two owners is repaired deterministically */
+    const existing = await QV.safeAsync(() => QV.d1.one(env, `SELECT telegram_id FROM qv_admins WHERE role = 'owner' LIMIT 1`), null);
+    const role = existing ? 'admin' : 'owner';
+    const name = String(o.name || '').slice(0, 40);
+    await QV.d1.run(env,
+      `INSERT INTO qv_admins (telegram_id, name, role, added_at) VALUES (?,?,?,unixepoch())
+       ON CONFLICT(telegram_id) DO UPDATE SET role = excluded.role, name = excluded.name`,
+      chat, name, role);
+    if (role === 'owner') {
+      await QV.safeAsync(() => QV.d1.run(env,
+        `UPDATE qv_admins SET role = 'admin' WHERE role = 'owner' AND telegram_id <> (
+           SELECT telegram_id FROM qv_admins WHERE role = 'owner' ORDER BY added_at ASC, telegram_id ASC LIMIT 1)`), null);
+    }
+    await QV.safeAsync(() => QV.d1.Kv.del(env, 'qv:owner:claim:' + fp), null);
+    await QV.safeAsync(() => QV.d1.Kv.del(env, 'qv:owner:fail:' + chat), null);
+    await QV.safeAsync(() => QV.d1.Kv.set(env, 'qv:owner:meta', {
+      at: now * 1000, chat: mask(chat), role, via: o.via || 'telegram', fp,
+    }, 0), null);
+    await QV.safeAsync(() => QV.emit(env, 'owner:claim', role === 'owner' ? 'warn' : 'info', {
+      message: `telegram ${role} bound (${mask(chat)})`, ctx,
+    }), null);
+    return { ok: true, chat, role, masked: mask(chat), first: role === 'owner' };
+  };
+
+  const bumpFail = async (env, chat) => {
+    const cur = num0(await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:fail:' + chat, 0), 0));
+    await QV.safeAsync(() => QV.d1.Kv.set(env, 'qv:owner:fail:' + chat, cur + 1, RETRY_WINDOW), null);
+  };
+
+  const add = async (env, ctx, chat, role = 'admin', name = '') => {
+    const id = await resolveTarget(env, chat);
+    if (!id) return { ok: false, error: 'a numeric telegram chat id (or a known fingerprint) is required' };
+    const r = ['owner', 'admin', 'viewer'].includes(role) ? role : 'admin';
+    const count = await QV.safeAsync(() => QV.d1.one(env, `SELECT COUNT(*) AS n FROM qv_admins`), { n: 0 });
+    if (r !== 'viewer' && Number(count && count.n || 0) >= num(env, 'OWNER_MAX_ADMINS', 8, 1, 50)) {
+      return { ok: false, error: 'OWNER_MAX_ADMINS reached' };
+    }
+    await QV.d1.run(env,
+      `INSERT INTO qv_admins (telegram_id, name, role, added_at) VALUES (?,?,?,unixepoch())
+       ON CONFLICT(telegram_id) DO UPDATE SET role = excluded.role, name = excluded.name`,
+      id, String(name || '').slice(0, 40), r);
+    QV.emit(env, 'owner:add', 'info', { message: `telegram ${r} added (${mask(id)})`, ctx });
+    return { ok: true, telegram_id: id, role: r };
+  };
+
+  const remove = async (env, ctx, chat) => {
+    const id = await resolveTarget(env, chat);
+    if (!id) return { ok: false, error: 'unknown admin' };
+    if (envIds(env).includes(id)) return { ok: false, error: 'the env-configured id cannot be removed' };
+    await QV.d1.run(env, `DELETE FROM qv_admins WHERE telegram_id = ?`, id);
+    await QV.safeAsync(() => QV.emit(env, 'owner:remove', 'warn', { message: `telegram admin removed (${mask(id)})`, ctx }), null);
+    return { ok: true, removed: id };
+  };
+
+  const rotate = async (env, ctx) => {
+    const rows = await QV.safeAsync(() => QV.d1.all(env,
+      `SELECT key FROM qv_kv WHERE key LIKE 'qv:owner:claim:%' AND key NOT LIKE 'qv:owner:claim:used:%'`), []) || [];
+    let n = 0;
+    for (const r of rows) { await QV.safeAsync(() => QV.d1.Kv.del(env, r.key), null); n++; }
+    await QV.safeAsync(() => QV.emit(env, 'owner:rotate', 'info', { message: `${n} pending owner code(s) revoked`, ctx }), null);
+    return { ok: true, revoked: n };
+  };
+
+  const status = async (env) => {
+    const res = await resolve(env);
+    const meta = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:meta', null), null);
+    const pending = await QV.safeAsync(() => QV.d1.one(env,
+      `SELECT COUNT(*) AS n FROM qv_kv WHERE key LIKE 'qv:owner:claim:%' AND key NOT LIKE 'qv:owner:claim:used:%'
+         AND (expires_at IS NULL OR expires_at > unixepoch())`), { n: 0 });
+    const queued = await QV.safeAsync(() => QV.d1.Kv.get(env, 'qv:owner:queue', []), []) || [];
+    return {
+      env_configured: res.env.length > 0,
+      env_ids: res.env.map(mask),
+      claimed: res.owners.length > 0,
+      owner: res.owner ? mask(res.owner.telegram_id) : null,
+      owners: res.owners.length,
+      admins: await Promise.all(res.admins.map(async (a) => ({
+        /* the raw chat id never leaves this module: callers get a masked form
+           for display and a non-reversible fingerprint for addressing */
+        id: mask(a.telegram_id), fp: await fpOf(env, a.telegram_id),
+        role: a.role, source: a.source, name: a.name || null, added_at: a.added_at || null,
+      }))),
+      pending_codes: Number(pending && pending.n || 0),
+      queued_alerts: Array.isArray(queued) ? queued.length : 0,
+      locked: locked(env),
+      /* diagnostics: where the HMAC pepper comes from.  `d1` means fingerprints
+         survive rotating ADMIN_PASSWORD / the bot token; `env` means the
+         operator pinned OWNER_PEPPER; anything else is a node without durable
+         storage, where nothing else works either */
+      pepper_source: await QV.safeAsync(() => pepperSource(env), 'ephemeral'),
+      claimed_at: meta && meta.at ? meta.at : null,
+      mode: locked(env) ? 'env-only' : (res.owners.length ? 'bound' : 'claimable'),
+    };
+  };
+
+  /** called from the boot sequence: an env id is always materialised in D1 so
+      role lookups, notifications and the admin list agree with each other */
+  const sync = async (env, ctx) => {
+    /* commit the pepper on the first boot rather than on first use: a node that
+       has never minted a code would otherwise report `pepper_source: 'derived'`
+       and the console would warn about fingerprints that are about to become
+       stable anyway.  One INSERT OR IGNORE per deployment, then it is a read. */
+    await QV.safeAsync(() => pepperOf(env), null);
+    const ids = envIds(env);
+    for (const id of ids) {
+      const row = await QV.safeAsync(() => QV.d1.one(env, `SELECT role FROM qv_admins WHERE telegram_id = ?`, id), null);
+      if (!row) {
+        await QV.safeAsync(() => QV.d1.run(env, `INSERT OR IGNORE INTO qv_admins (telegram_id, name, role) VALUES (?, 'env owner', 'owner')`, id), null);
+      } else if (row.role !== 'owner') {
+        await QV.safeAsync(() => QV.d1.run(env, `UPDATE qv_admins SET role = 'owner' WHERE telegram_id = ?`, id), null);
+      }
+    }
+    return { ids: ids.length, pepper: await QV.safeAsync(() => pepperSource(env), 'ephemeral') };
+  };
+
+  QV.owner = {
+    /* introspection */
+    ALPHABET, mask, envIds, resolve, recipientIds, roleOf, isAdmin, isOwner: async (env, chat) => (await roleOf(env, chat)) === 'owner',
+    unclaimed, rowsOf, status, locked, byFp, resolveTarget,
+    /* keyed handles — never reversible, safe to transport */
+    tag, fpOf, digestOf, pepperSource,
+    /* lifecycle */
+    invite, redeem, add, remove, rotate, sync, deepLink,
+    /* notification plumbing (used by the telegram module) */
+    queueAlert, drainQueue, requeueAlerts, queueLen,
+    KEYS: { claim: 'qv:owner:claim:', used: 'qv:owner:claim:used:' },
+  };
 })();
 
 
@@ -8913,6 +9721,10 @@ p{color:#93a0c4;margin:6px 0}b{color:#5b8cff}.box{margin-top:18px;border:1px sol
     { id: 'ai-refresh', every: 21600, budgetMs: 20000, run: async (env, ctx) => QV.ai.refresh(env, ctx) },
     { id: 'health-probe', every: 1800, budgetMs: 15000, run: async (env, ctx) => QV.ai.probe(env, ctx) },
     { id: 'telegram-poll', every: 120, budgetMs: 8000, run: async (env, ctx) => QV.telegram.pollOnce(env, ctx) },
+    /* alerts parked while the node had no owner go out the moment one exists —
+       including an owner bound from the panel or from a secret added later,
+       which never passes through the Telegram /claim path */
+    { id: 'owner-alerts', every: 300, budgetMs: 8000, run: async (env) => QV.telegram.flushQueue(env) },
     { id: 'metrics-rollup', every: 900, budgetMs: 10000, run: async (env) => QV.metrics.rollup(env) },
     { id: 'jobs-gc', every: 900, budgetMs: 5000, run: async (env) => QV.d1.Jobs.gc(env) },
     { id: 'backup', every: 86400, budgetMs: 25000, run: async (env, ctx) => QV.d1.exportAll(env, { toKv: true, ctx }) },
@@ -9205,10 +10017,19 @@ QV.router = { handleFetch, runUnitSides, scheduled, queue, CRON_TASKS, selfHeal,
     switch (seg[0]) {
       /* ── identity ────────────────────────────────────────────────────── */
       case 'me': {
-        if (isAdmin) return ok({ role: 'admin', via: who.via, version: QV.VERSION, features: Object.keys(cfg.features || {}).filter(k => cfg.features[k]) });
+        if (isAdmin) {
+          /* the console reads `owner` to decide whether the “Connect Telegram”
+             card should be a warning or a normal status line */
+          const owner = QV.owner ? await QV.safeAsync(() => QV.owner.status(c.env), null) : null;
+          return ok({
+            role: 'admin', via: who.via, version: QV.VERSION,
+            features: Object.keys(cfg.features || {}).filter(k => cfg.features[k]),
+            owner: owner ? { claimed: owner.claimed, mode: owner.mode, admins: owner.admins.length, locked: owner.locked } : null,
+          });
+        }
         return ok({ role: 'user', user: sanitizeUser(who.user), token: '' });
       }
-      case undefined: return ok({ api: true, version: QV.VERSION, routes: ['login','logout','me','stats','users','sessions','strategy','sni','ips','endpoints','dns','ai','events','cron','jobs','cache','ss','shape','selftest','backup','hosts','sub','tg'] });
+      case undefined: return ok({ api: true, version: QV.VERSION, routes: ['login','logout','me','stats','users','sessions','strategy','sni','ips','endpoints','dns','ai','events','cron','jobs','cache','ss','shape','selftest','backup','hosts','sub','owner','tg'] });
 
       /* ── dashboard ───────────────────────────────────────────────────── */
       case 'stats': {
@@ -9528,12 +10349,61 @@ QV.router = { handleFetch, runUnitSides, scheduled, queue, CRON_TASKS, selfHeal,
         }
         return ok({ url: built.subUrl, format, nodes: built.uris ? built.uris.length : undefined, hints: built.hints, preview: String(built.body).slice(0, 400) });
       }
+      /* ── owner binding: how the node finds its operator without
+            ADMIN_TELEGRAM_ID (31-owner.js).  Everything here needs an admin
+            session, and nothing here ever returns a raw chat id. ───────── */
+      case 'owner': {
+        const g = needAdmin(); if (g) return g;
+        if (!QV.owner) return fail('owner module unavailable', 501);
+        if (method === 'GET') return ok(await QV.owner.status(c.env));
+        if (method === 'DELETE') {
+          const target = seg[1];
+          if (!target) return fail('telegram id required', 400);
+          return ok(await QV.owner.remove(c.env, c.ctx, target));
+        }
+        const b = await body(c.request);
+        const action = String(b.action || 'status');
+        if (action === 'invite' || action === 'mint') {
+          /* rate-limited per session: minting codes must not be spammable even
+             by somebody who already holds the admin password */
+          const bucket = QV.tokenBucket('owner:api:' + (who.via || 'x'), 10, 4);
+          if (!bucket.take()) return fail('slow down', 429);
+          const r = await QV.owner.invite(c.env, c.ctx, {
+            ttl_min: b.ttl_min, by: 'api:' + who.via, via: 'api',
+          });
+          if (!r.ok) return fail(r.error || 'invite failed', 409);
+          return ok(r);
+        }
+        if (action === 'rotate') return ok(await QV.owner.rotate(c.env, c.ctx));
+        if (action === 'add') {
+          const r = await QV.owner.add(c.env, c.ctx, b.telegram_id || b.chat_id, b.role || 'admin', b.name || '');
+          /* an admin bound by id never passes through Telegram's /claim, so the
+             alerts queued while the node was unclaimed are delivered right now
+             instead of waiting for the owner-alerts cron tick */
+          if (r && r.ok && QV.telegram && QV.telegram.flushQueue && c.ctx && c.ctx.waitUntil) {
+            c.ctx.waitUntil(QV.telegram.flushQueue(c.env).catch(() => {}));
+          }
+          return ok(r);
+        }
+        if (action === 'remove') return ok(await QV.owner.remove(c.env, c.ctx, b.telegram_id || b.chat_id || seg[1]));
+        if (action === 'status') return ok(await QV.owner.status(c.env));
+        return fail('unknown action', 400);
+      }
+
       case 'tg': {
         const g = needAdmin(); if (g) return g;
         if (method === 'GET') return ok(await QV.telegram.status(c.env));
         const b = await body(c.request);
         if (b.action === 'setup') { const r = await QV.telegram.ensureWebhook(c.env, c.ctx, c.url.origin); return ok(r); }
-        if (b.action === 'send') { const r = await QV.telegram.send(c.env, b.chat_id || QV.env.get(c.env, 'ADMIN_TELEGRAM_ID', ''), b.text, b.keyboard); return ok(r); }
+        /* `send` without a chat_id means "the operators": fan out through the
+           resolved recipient list instead of reading ADMIN_TELEGRAM_ID */
+        if (b.action === 'send') {
+          const r = b.chat_id
+            ? await QV.telegram.send(c.env, b.chat_id, b.text, b.keyboard)
+            : await QV.telegram.notifyAdmin(c.env, b.text, b.keyboard);
+          return ok(r);
+        }
+        if (b.action === 'notify') return ok(await QV.telegram.notifyAdmin(c.env, b.text, b.keyboard));
         if (b.action === 'broadcast') { const r = await QV.telegram.broadcast(c.env, c.ctx, b.text, b.filter || {}); return ok(r); }
         if (b.action === 'unset') { await QV.telegram.deleteWebhook(c.env); return ok({ webhook: 'removed' }); }
         return fail('unknown action', 400);
@@ -9984,12 +10854,14 @@ QV.qr = (() => {
         add:'کاربر جدید',run:'اجرا',refresh:'به‌روزرسانی',search:'جستجو',total:'کل کاربران',online:'آنلاین',traffic:'ترافیک',
         quota:'سهمیه',status:'وضعیت',actions:'عملیات',revive:'فعال‌سازی',kill:'قطع کانفیگ',del:'حذف',sub:'لینک اشتراک',
         copy:'کپی',ask:'بپرسید…',send:'ارسال',download:'دانلود',restore:'بازیابی',yes:'بله',no:'خیر',
+        access:'دسترسی تلگرام',
         hint:'برای دیدن کانفیگ روی «لینک اشتراک» بزنید.'},
     en:{dash:'Dashboard',users:'Users',sessions:'Sessions',strategy:'Anti-DPI',sni:'SNI Pool',ips:'Clean IPs',dns:'DNS',
         ai:'AI Copilot',logs:'Events',backup:'Backup',test:'Self-test',logout:'Sign out',login:'Sign in',save:'Save',
         add:'New user',run:'Run',refresh:'Refresh',search:'Search',total:'Users',online:'Online',traffic:'Traffic',
         quota:'Quota',status:'Status',actions:'Actions',revive:'Revive',kill:'Cut config',del:'Delete',sub:'Sub link',
         copy:'Copy',ask:'Ask…',send:'Send',download:'Download',restore:'Restore',yes:'Yes',no:'No',
+        access:'Telegram access',
         hint:'Click "Sub link" to reveal a config.'}
   };
   const t = (k) => (T[state.lang]||T.fa)[k] || k;
@@ -10124,6 +10996,51 @@ QV.qr = (() => {
         <div class="card"><h3>${t('restore')}</h3><textarea id="restoreBox" rows="9" placeholder='{"users":[…]}'></textarea>
         <div class="row" style="margin-top:10px"><button class="warn" onclick="QV.restore()">${t('restore')}</button></div></div>
       </div>`,
+    access: async () => {
+      const s = await api('owner');
+      const fa = state.lang === 'fa';
+      const rows = (s.admins||[]).map(a => `<tr>
+        <td><code>${esc(a.id)}</code></td>
+        <td><span class="pill ${a.role==='owner'?'on':''}">${esc(a.role)}</span></td>
+        <td class="muted">${esc(a.source==='env'?(fa?'متغیر محیطی':'env var'):(fa?'اتصال خودکار':'claimed'))}</td>
+        <td class="muted">${esc(a.name||'—')}</td>
+        <td>${a.source==='env'?'<span class="muted">🔒</span>':`<button class="sm bad" onclick="QV.ownerRemove('${esc(a.fp)}','${esc(a.id)}')">${t('del')}</button>`}</td></tr>`).join('');
+      return `<div class="grid g2">
+        <div class="card"><h3>${fa?'اتصال تلگرام':'Telegram binding'}</h3>
+          <div class="sub" style="margin-bottom:10px">${fa
+            ? 'این گره به <b>ADMIN_TELEGRAM_ID</b> نیازی ندارد. یک کد یک‌بارمصرف بسازید و در تلگرام <code>/claim CODE</code> بفرستید؛ چت شما به‌صورت خودکار مالک می‌شود. شناسهٔ شما هرگز به‌صورت متن آشکار در کد، URL یا لاگ ظاهر نمی‌شود.'
+            : 'This node needs <b>no ADMIN_TELEGRAM_ID</b>. Mint a single-use code, then send <code>/claim CODE</code> in Telegram — that chat becomes the owner automatically. Your id is never stored or shown in clear text.'}</div>
+          ${kv(fa?'حالت':'mode', s.mode)}
+          ${kv(fa?'مالک':'owner', s.claimed ? s.owner : (fa?'— هنوز متصل نشده':'— unclaimed'))}
+          ${kv(fa?'کدهای در انتظار':'pending codes', s.pending_codes)}
+          ${kv(fa?'هشدارهای در صف':'queued alerts', s.queued_alerts)}
+          ${kv(fa?'کلید اثرانگشت':'fingerprint key', s.pepper_source === 'env'
+            ? (fa?'پین‌شده با OWNER_PEPPER':'pinned with OWNER_PEPPER')
+            : s.pepper_source === 'd1'
+              ? (fa?'ثبت‌شده در D1 — پایدار':'committed in D1 — stable')
+              : (fa?'مشتق‌شده — ناپایدار':'derived — unstable'))}
+          ${(s.pepper_source && s.pepper_source !== 'd1' && s.pepper_source !== 'env')
+            ? `<div class="warn sub" style="margin-top:8px">${fa
+              ? '⚠️ کلید اثرانگشت هنوز در D1 ثبت نشده است؛ تا پایگاه داده در دسترس نباشد، چرخش رمزها می‌تواند دکمه‌های لغو دسترسی را از کار بیندازد.'
+              : '⚠️ the fingerprint key is not committed yet — until the database is reachable, rotating a secret can break the revoke buttons.'}</div>` : ''}
+          ${s.locked?`<div class="bad sub" style="margin-top:8px">🔒 OWNER_LOCK=1</div>`:''}
+          <div class="row" style="margin-top:12px">
+            <button onclick="QV.ownerInvite()">${fa?'🔑 ساخت کد اتصال':'🔑 New claim code'}</button>
+            <button class="ghost" onclick="QV.ownerRotate()">${fa?'♻️ باطل کردن کدها':'♻️ Revoke codes'}</button>
+          </div>
+          <div id="ownerCode" class="sub" style="margin-top:10px"></div>
+        </div>
+        <div class="card"><div class="row"><h3 style="margin:0">${fa?'مدیران':'Admins'} (${(s.admins||[]).length})</h3><div class="sp"></div>
+          <button class="sm ghost" onclick="QV.ownerAdd()">+ ${fa?'افزودن با شناسه':'Add by id'}</button></div>
+          <div style="overflow:auto;margin-top:12px"><table><thead><tr>
+          <th>ID</th><th>${fa?'نقش':'Role'}</th><th>${fa?'منبع':'Source'}</th><th>${fa?'نام':'Name'}</th><th></th>
+          </tr></thead><tbody>${rows||`<tr><td colspan="5" class="muted">${esc(s.owner_none||'—')}</td></tr>`}</tbody></table></div>
+          <div class="sub" style="margin-top:10px">${fa
+            ? 'نقش‌ها: <b>owner</b> (همه‌چیز + مدیریت دسترسی)، <b>admin</b> (همه‌چیز جز مدیریت دسترسی)، <b>viewer</b> (فقط آمار).'
+            : 'Roles: <b>owner</b> (everything + access control), <b>admin</b> (everything but access control), <b>viewer</b> (read-only).'}</div>
+        </div>
+      </div>`;
+    },
     test: async () => `<div class="grid g2">
         <div class="card"><div class="row"><h3 style="margin:0">${t('test')}</h3><div class="sp"></div>
         <button onclick="QV.selftest(1)">${state.lang==='fa'?'اجرای کامل':'Run full'}</button></div>
@@ -10221,6 +11138,45 @@ QV.qr = (() => {
       catch(e){ toast(e.message,'bad'); } },
     filterUsers: (q) => { q = q.toLowerCase(); $$('#urows tr').forEach(tr => tr.classList.toggle('hidden', !tr.dataset.name.toLowerCase().includes(q))); },
     copy: async (txt) => { try { await navigator.clipboard.writeText(txt); toast('copied'); } catch(e){ prompt('copy', txt); } },
+    /* ── Telegram owner binding ───────────────────────────────────────────
+       The code is rendered once, in this tab, and never persisted anywhere:
+       not in localStorage, not in the URL, not in a log line. */
+    ownerInvite: async () => {
+      const box = $('#ownerCode'); if (box) box.innerHTML = '…';
+      try {
+        const r = await api('owner', { method:'POST', body:{ action:'invite' } });
+        const fa = state.lang === 'fa';
+        if (box) box.innerHTML =
+          `<div class="card" style="margin:0;background:#0a0f20">
+             <div class="sub">${fa?'کد یک‌بارمصرف — فقط یک بار قابل استفاده است':'Single-use code — valid once'}</div>
+             <div class="code" style="font-size:18px;letter-spacing:2px">${esc(r.code)}</div>
+             <div class="sub" style="margin-top:6px">${fa?'اعتبار':'expires in'}: ${esc(r.ttl_min)} ${fa?'دقیقه':'min'} · ${esc(r.note||'')}</div>
+             <div class="row" style="margin-top:8px">
+               <button class="sm" onclick="QV.copy('${esc(r.code)}')">${t('copy')}</button>
+               <button class="sm ghost" onclick="QV.copy('/claim ${esc(r.code)}')">${fa?'کپی دستور':'Copy command'}</button>
+               ${r.link?`<a class="btn sm ghost" href="${esc(r.link)}" target="_blank" rel="noopener">${fa?'📲 بازکردن در تلگرام':'📲 Open in Telegram'}</a>`:''}
+             </div>
+           </div>`;
+        toast(fa ? 'کد ساخته شد' : 'claim code minted');
+      } catch(e) { if (box) box.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; toast(e.message,'bad'); }
+    },
+    ownerRotate: async () => { try { const r = await api('owner',{method:'POST',body:{action:'rotate'}});
+      toast((state.lang==='fa'?'باطل شد: ':'revoked: ')+(r.revoked||0)); PANEL.render(); } catch(e){ toast(e.message,'bad'); } },
+    ownerAdd: async () => {
+      const fa = state.lang === 'fa';
+      const id = prompt(fa?'شناسهٔ عددی تلگرام:':'Numeric Telegram id:'); if(!id) return;
+      const role = prompt(fa?'نقش (owner/admin/viewer):':'Role (owner/admin/viewer):','admin')||'admin';
+      try { const r = await api('owner',{method:'POST',body:{action:'add',telegram_id:id.trim(),role:role.trim()}});
+        if (r && r.ok === false) throw new Error(r.error||'failed');
+        toast(fa?'اضافه شد':'added'); PANEL.render(); } catch(e){ toast(e.message,'bad'); }
+    },
+    ownerRemove: async (fp, shown) => {
+      /* the button carries the non-reversible fingerprint, never the real id */
+      if(!confirm((state.lang==='fa'?'دسترسی حذف شود؟ ':'Revoke access? ')+(shown||fp))) return;
+      try { const r = await api('owner/'+encodeURIComponent(String(fp||'')),{method:'DELETE'});
+        if (r && r.ok === false) throw new Error(r.error||'failed');
+        toast(state.lang==='fa'?'حذف شد':'revoked'); PANEL.render(); } catch(e){ toast(e.message,'bad'); }
+    },
   });
 
   window.addEventListener('DOMContentLoaded', async () => {
@@ -10253,7 +11209,7 @@ QV.qr = (() => {
   const shell = (opts = {}) => {
     const lang = opts.lang === 'en' ? 'en' : 'fa';
     const dir = lang === 'fa' ? 'rtl' : 'ltr';
-    const tabs = [['dash', '📊'], ['users', '👥'], ['sessions', '🔌'], ['strategy', '🛡'], ['sni', '🎭'], ['ips', '🌐'], ['dns', '🧭'], ['ai', '🤖'], ['logs', '📜'], ['backup', '💾'], ['test', '🧪']];
+    const tabs = [['dash', '📊'], ['users', '👥'], ['sessions', '🔌'], ['strategy', '🛡'], ['sni', '🎭'], ['ips', '🌐'], ['dns', '🧭'], ['ai', '🤖'], ['logs', '📜'], ['access', '🔐'], ['backup', '💾'], ['test', '🧪']];
     return `<!doctype html><html lang="${lang}" dir="${dir}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow"><meta name="color-scheme" content="dark">
@@ -11297,6 +12253,82 @@ QV.qr = (() => {
         const st = await QV.d1.Fsm.get(env, chat);
         await QV.d1.Fsm.clear(env, chat);
         return st.state === 'awaiting' && st.data.step === 2;
+      }));
+      /* ── KV expiry is stored in unix *seconds*; a millisecond comparison made
+            every TTL'd row look expired on the first cross-isolate read ────── */
+      out.push(await t('a TTL value survives a cold read and expires on time', async () => {
+        const key = 'qv:selfcheck:ttl:' + QV.shortId(4);
+        await QV.d1.Kv.put(env, key, { n: 7 }, 300);
+        QV.lru.delete('kv:' + key);                       // force the D1 path
+        const warm = await QV.d1.Kv.get(env, key, null);
+        QV.lru.delete('kv:' + key);
+        const row = await QV.d1.one(env, `SELECT expires_at FROM qv_kv WHERE key = ?`, key);
+        const inSeconds = Number(row?.expires_at || 0) < Math.floor(Date.now() / 1000) + 301;
+        await QV.d1.Kv.del(env, key);
+        return !!warm && warm.n === 7 && inSeconds;
+      }));
+      out.push(await t('an expired TTL value is not returned', async () => {
+        const key = 'qv:selfcheck:exp:' + QV.shortId(4);
+        /* written in the past by hand, exactly as a stale row would look */
+        await QV.d1.run(env, `INSERT INTO qv_kv (key,value,expires_at) VALUES (?,?,?)
+                              ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at`,
+          key, JSON.stringify({ stale: true }), Math.floor(Date.now() / 1000) - 60);
+        QV.lru.delete('kv:' + key);
+        const got = await QV.d1.Kv.get(env, key, 'default');
+        await QV.d1.run(env, `DELETE FROM qv_kv WHERE key = ?`, key);
+        QV.lru.delete('kv:' + key);
+        return got === 'default';
+      }));
+      /* ── owner binding primitives (31-owner.js).  The real claim flow is not
+            exercised here: redeeming a synthetic chat would steal the owner
+            role on a node that has not been claimed yet. ─────────────────── */
+      out.push(await t('the owner pepper is stable across calls', async () => {
+        const a = await QV.owner.digestOf(env, 'AAAA-BBBB');
+        const b = await QV.owner.digestOf(env, 'aaaa bbbb');   // normalised
+        const c = await QV.owner.digestOf(env, 'AAAA-BBBC');
+        return a === b && a !== c && /^[0-9a-f]{64}$/.test(a);
+      }));
+      /* the invariant that keeps Telegram/console buttons working after an
+         operator rotates ADMIN_PASSWORD or the bot token: the pepper in use is
+         the one committed to D1, not one re-derived from the live secrets */
+      out.push(await t('the owner pepper is committed, so fingerprints outlive a secret rotation', async () => {
+        const src = await QV.owner.pepperSource(env);
+        const fp = await QV.owner.fpOf(env, '123456789');
+        if (src === 'env') return /^[0-9a-f]{12}$/.test(fp);      // pinned by the operator
+        if (src !== 'd1') return !(env && env.DB);                // no durable store at all
+        const p = String(await QV.d1.Kv.get(env, 'qv:owner:pepper', '') || '');
+        const want = QV.hex(await QV.hmacSha256(QV.utf8(p), QV.utf8('id:123456789'))).slice(0, 12);
+        return want === fp;
+      }));
+      out.push(await t('a chat id is only ever exposed masked or fingerprinted', async () => {
+        const id = '123456789';
+        const m = QV.owner.mask(id);
+        const fp = await QV.owner.fpOf(env, id);
+        return m && !m.includes(id) && m.endsWith('6789') && /^[0-9a-f]{12}$/.test(fp) && fp !== id;
+      }));
+      out.push(await t('an admin fingerprint resolves back to exactly one row', async () => {
+        const id = '99' + String(Date.now()).slice(-8);
+        await QV.d1.run(env, `INSERT INTO qv_admins (telegram_id, name, role) VALUES (?, 'selfcheck', 'viewer')
+                              ON CONFLICT(telegram_id) DO NOTHING`, id);
+        const fp = await QV.owner.fpOf(env, id);
+        const row = await QV.owner.byFp(env, fp);
+        const unknown = await QV.owner.byFp(env, 'deadbeefcafe');
+        await QV.d1.run(env, `DELETE FROM qv_admins WHERE telegram_id = ?`, id);
+        return !!row && String(row.telegram_id) === id && row.role === 'viewer' && !unknown;
+      }));
+      out.push(await t('claim consumption is atomic (INSERT OR IGNORE wins once)', async () => {
+        const key = 'qv:selfcheck:claim:' + QV.shortId(6);
+        const first = await QV.d1.run(env, `INSERT OR IGNORE INTO qv_kv (key,value,expires_at) VALUES (?,?,?)`, key, '1', null);
+        const second = await QV.d1.run(env, `INSERT OR IGNORE INTO qv_kv (key,value,expires_at) VALUES (?,?,?)`, key, '1', null);
+        const changes = (r) => Number((r && r.meta && r.meta.changes) ?? (r && r.changes) ?? 0);
+        await QV.d1.run(env, `DELETE FROM qv_kv WHERE key = ?`, key);
+        return changes(first) === 1 && changes(second) === 0;
+      }));
+      out.push(await t('the owner status never leaks a raw chat id', async () => {
+        const s = await QV.owner.status(env);
+        const blob = JSON.stringify(s);
+        const leak = (await QV.owner.rowsOf(env)).some(r => String(r.telegram_id).length > 4 && blob.includes(String(r.telegram_id)));
+        return typeof s.claimed === 'boolean' && Array.isArray(s.admins) && !leak;
       }));
       out.push(await t('events log accepts writes', async () => {
         /* `info` is the lowest severity that is persisted — `debug` stays in
@@ -37905,7 +38937,7 @@ if (typeof __QF_REGISTER === 'function') {
   for (const [k, v] of Object.entries(__QF_UNIT_u06)) { if (typeof v !== 'undefined') __QF_REGISTER(k, v, 'unit:u06'); }
 }
 
-/* ─────────────── u07.js — 1300 lines ─────────────── */
+/* ─────────────── u07.js — 1307 lines ─────────────── */
 let __QF_SIDE_u07 = null;
 const __QF_UNIT_u07 = (() => {
 const CONFIG = {
@@ -38866,7 +39898,14 @@ class TelegramBot {
   }
   
   static async sendMessage(chatId, text, env) {
+    /* No explicit destination: hand it to the core control plane, which
+       resolves every bound owner/admin from D1 (qv_admins) — so this legacy
+       alert path works with no ADMIN_TELEGRAM_ID configured at all. */
+    if (!chatId && globalThis.QV && QV.telegram && QV.telegram.notifyAdmin) {
+      return QV.telegram.notifyAdmin(env, text);
+    }
     const token = env.TELEGRAM_BOT_TOKEN;
+    if (!token || !chatId) return { ok: false, error: 'no bot token or destination' };
     const url = `https://api.telegram.org/bot${token}/sendMessage`;
     await fetch(url, {
       method: 'POST',
@@ -38874,11 +39913,11 @@ class TelegramBot {
       body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' })
     });
   }
-  
+
   static async sendAIAlert(env, forensics, strategy) {
-    const adminId = env.ADMIN_TELEGRAM_ID;
     const message = `🤖 Quantum Alert\nAnalysis: ${forensics.substring(0, 100)}\nStrategy: Mimic ${strategy.mimic}, Padding ${strategy.padding}\nStatus: Healed`;
-    await this.sendMessage(adminId, message, env);
+    /* destination resolved by the owner module, not by an env var */
+    await this.sendMessage(env.ADMIN_TELEGRAM_ID || null, message, env);
   }
   
   static async getStats(env) {
@@ -39120,7 +40159,7 @@ if (typeof __QF_REGISTER === 'function') {
   for (const [k, v] of Object.entries(__QF_UNIT_u07)) { if (typeof v !== 'undefined') __QF_REGISTER(k, v, 'unit:u07'); }
 }
 
-/* ─────────────── u08.js — 2679 lines ─────────────── */
+/* ─────────────── u08.js — 2691 lines ─────────────── */
 let __QF_SIDE_u08 = null;
 const __QF_UNIT_u08 = (() => {
 const CONFIG = {
@@ -39590,8 +40629,20 @@ class QuantumAIOrchestrator {
 ────────────────`;
 
     const botToken = env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) return;
+
+    /* The destination is no longer an env var: the core control plane resolves
+       every bound owner/admin from D1 (qv_admins), so this legacy alert path
+       keeps working on a deployment that never set ADMIN_TELEGRAM_ID.  While
+       nobody is bound the message is queued in D1 instead of being dropped.
+       The raw fetch below stays as the fallback for a bundle without the core. */
+    if (globalThis.QV && QV.telegram && QV.telegram.notifyAdmin) {
+      const r = await QV.telegram.notifyAdmin(env, message, null, { html: false });
+      if (r && r.ok) { console.log('📨 AI Alert Sent to Telegram'); return; }
+      if (r && r.queued) { console.log('📨 AI Alert queued — no owner bound yet'); return; }
+    }
     const chatId = env.ADMIN_TELEGRAM_ID;
-    if (!botToken || !chatId) return;
+    if (!chatId) return;
 
     try {
       await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
@@ -41978,7 +43029,7 @@ if (typeof __QF_REGISTER === 'function') {
   for (const [k, v] of Object.entries(__QF_UNIT_u09)) { if (typeof v !== 'undefined') __QF_REGISTER(k, v, 'unit:u09'); }
 }
 
-/* ─────────────── u10.js — 853 lines ─────────────── */
+/* ─────────────── u10.js — 865 lines ─────────────── */
 let __QF_SIDE_u10 = null;   /* 3 deferred statement(s) */
 const __QF_UNIT_u10 = (() => {
 const CONFIG = {
@@ -42448,8 +43499,20 @@ class QuantumAIOrchestrator {
 ────────────────`;
 
     const botToken = env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) return;
+
+    /* The destination is no longer an env var: the core control plane resolves
+       every bound owner/admin from D1 (qv_admins), so this legacy alert path
+       keeps working on a deployment that never set ADMIN_TELEGRAM_ID.  While
+       nobody is bound the message is queued in D1 instead of being dropped.
+       The raw fetch below stays as the fallback for a bundle without the core. */
+    if (globalThis.QV && QV.telegram && QV.telegram.notifyAdmin) {
+      const r = await QV.telegram.notifyAdmin(env, message, null, { html: false });
+      if (r && r.ok) { console.log('📨 AI Alert Sent to Telegram'); return; }
+      if (r && r.queued) { console.log('📨 AI Alert queued — no owner bound yet'); return; }
+    }
     const chatId = env.ADMIN_TELEGRAM_ID;
-    if (!botToken || !chatId) return;
+    if (!chatId) return;
 
     try {
       await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
@@ -42762,21 +43825,21 @@ async function testFailureHeader() {
 /* u10.js: statements lifted out of module scope (I/O and awaits are not
    allowed there) — they run once per isolate, in their own lexical scope */
 __QF_SIDE_u10 = async () => {
-    /* u10.js:837 (ExpressionStatement) */
+    /* u10.js:849 (ExpressionStatement) */
     try {
       const log = __qfSym("log");
       console.log('✅ Tests Passed: Normal Morphing -', await testNormalMorphing({}));
-    } catch (e) { __qfSideFail("u10.js", 837, e); }
-    /* u10.js:838 (ExpressionStatement) */
+    } catch (e) { __qfSideFail("u10.js", 849, e); }
+    /* u10.js:850 (ExpressionStatement) */
     try {
       const log = __qfSym("log");
       console.log('✅ Tests Passed: Boundary Fragmentation -', await testBoundaryFragmentation({}));
-    } catch (e) { __qfSideFail("u10.js", 838, e); }
-    /* u10.js:839 (ExpressionStatement) */
+    } catch (e) { __qfSideFail("u10.js", 850, e); }
+    /* u10.js:851 (ExpressionStatement) */
     try {
       const log = __qfSym("log");
       console.log('✅ Tests Passed: Failure Header -', await testFailureHeader());
-    } catch (e) { __qfSideFail("u10.js", 839, e); }
+    } catch (e) { __qfSideFail("u10.js", 851, e); }
 };
 return { "CONFIG": typeof CONFIG === 'undefined' ? undefined : CONFIG, "MEMORY_CACHE": typeof MEMORY_CACHE === 'undefined' ? undefined : MEMORY_CACHE, "QuantumAIOrchestrator": typeof QuantumAIOrchestrator === 'undefined' ? undefined : QuantumAIOrchestrator, "ActiveSecurityLayer": typeof ActiveSecurityLayer === 'undefined' ? undefined : ActiveSecurityLayer, "NeuralTrafficMorpher": typeof NeuralTrafficMorpher === 'undefined' ? undefined : NeuralTrafficMorpher, "__GEN_DEFAULT_10": typeof __GEN_DEFAULT_10 === 'undefined' ? undefined : __GEN_DEFAULT_10, "testNormalMorphing": typeof testNormalMorphing === 'undefined' ? undefined : testNormalMorphing, "testBoundaryFragmentation": typeof testBoundaryFragmentation === 'undefined' ? undefined : testBoundaryFragmentation, "testFailureHeader": typeof testFailureHeader === 'undefined' ? undefined : testFailureHeader };
 })();
