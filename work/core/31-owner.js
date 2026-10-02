@@ -442,6 +442,11 @@
   /** called from the boot sequence: an env id is always materialised in D1 so
       role lookups, notifications and the admin list agree with each other */
   const sync = async (env, ctx) => {
+    /* commit the pepper on the first boot rather than on first use: a node that
+       has never minted a code would otherwise report `pepper_source: 'derived'`
+       and the console would warn about fingerprints that are about to become
+       stable anyway.  One INSERT OR IGNORE per deployment, then it is a read. */
+    await QV.safeAsync(() => pepperOf(env), null);
     const ids = envIds(env);
     for (const id of ids) {
       const row = await QV.safeAsync(() => QV.d1.one(env, `SELECT role FROM qv_admins WHERE telegram_id = ?`, id), null);
@@ -451,7 +456,7 @@
         await QV.safeAsync(() => QV.d1.run(env, `UPDATE qv_admins SET role = 'owner' WHERE telegram_id = ?`, id), null);
       }
     }
-    return { ids: ids.length };
+    return { ids: ids.length, pepper: await QV.safeAsync(() => pepperSource(env), 'ephemeral') };
   };
 
   QV.owner = {

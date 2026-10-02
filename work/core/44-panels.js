@@ -249,6 +249,15 @@
           ${kv(fa?'مالک':'owner', s.claimed ? s.owner : (fa?'— هنوز متصل نشده':'— unclaimed'))}
           ${kv(fa?'کدهای در انتظار':'pending codes', s.pending_codes)}
           ${kv(fa?'هشدارهای در صف':'queued alerts', s.queued_alerts)}
+          ${kv(fa?'کلید اثرانگشت':'fingerprint key', s.pepper_source === 'env'
+            ? (fa?'پین‌شده با OWNER_PEPPER':'pinned with OWNER_PEPPER')
+            : s.pepper_source === 'd1'
+              ? (fa?'ثبت‌شده در D1 — پایدار':'committed in D1 — stable')
+              : (fa?'مشتق‌شده — ناپایدار':'derived — unstable'))}
+          ${(s.pepper_source && s.pepper_source !== 'd1' && s.pepper_source !== 'env')
+            ? `<div class="warn sub" style="margin-top:8px">${fa
+              ? '⚠️ کلید اثرانگشت هنوز در D1 ثبت نشده است؛ تا پایگاه داده در دسترس نباشد، چرخش رمزها می‌تواند دکمه‌های لغو دسترسی را از کار بیندازد.'
+              : '⚠️ the fingerprint key is not committed yet — until the database is reachable, rotating a secret can break the revoke buttons.'}</div>` : ''}
           ${s.locked?`<div class="bad sub" style="margin-top:8px">🔒 OWNER_LOCK=1</div>`:''}
           <div class="row" style="margin-top:12px">
             <button onclick="QV.ownerInvite()">${fa?'🔑 ساخت کد اتصال':'🔑 New claim code'}</button>

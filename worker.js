@@ -8852,6 +8852,11 @@ Otherwise reply with plain text only. Be concise and technical.`;
   /** called from the boot sequence: an env id is always materialised in D1 so
       role lookups, notifications and the admin list agree with each other */
   const sync = async (env, ctx) => {
+    /* commit the pepper on the first boot rather than on first use: a node that
+       has never minted a code would otherwise report `pepper_source: 'derived'`
+       and the console would warn about fingerprints that are about to become
+       stable anyway.  One INSERT OR IGNORE per deployment, then it is a read. */
+    await QV.safeAsync(() => pepperOf(env), null);
     const ids = envIds(env);
     for (const id of ids) {
       const row = await QV.safeAsync(() => QV.d1.one(env, `SELECT role FROM qv_admins WHERE telegram_id = ?`, id), null);
@@ -8861,7 +8866,7 @@ Otherwise reply with plain text only. Be concise and technical.`;
         await QV.safeAsync(() => QV.d1.run(env, `UPDATE qv_admins SET role = 'owner' WHERE telegram_id = ?`, id), null);
       }
     }
-    return { ids: ids.length };
+    return { ids: ids.length, pepper: await QV.safeAsync(() => pepperSource(env), 'ephemeral') };
   };
 
   QV.owner = {
@@ -11009,6 +11014,15 @@ QV.qr = (() => {
           ${kv(fa?'مالک':'owner', s.claimed ? s.owner : (fa?'— هنوز متصل نشده':'— unclaimed'))}
           ${kv(fa?'کدهای در انتظار':'pending codes', s.pending_codes)}
           ${kv(fa?'هشدارهای در صف':'queued alerts', s.queued_alerts)}
+          ${kv(fa?'کلید اثرانگشت':'fingerprint key', s.pepper_source === 'env'
+            ? (fa?'پین‌شده با OWNER_PEPPER':'pinned with OWNER_PEPPER')
+            : s.pepper_source === 'd1'
+              ? (fa?'ثبت‌شده در D1 — پایدار':'committed in D1 — stable')
+              : (fa?'مشتق‌شده — ناپایدار':'derived — unstable'))}
+          ${(s.pepper_source && s.pepper_source !== 'd1' && s.pepper_source !== 'env')
+            ? `<div class="warn sub" style="margin-top:8px">${fa
+              ? '⚠️ کلید اثرانگشت هنوز در D1 ثبت نشده است؛ تا پایگاه داده در دسترس نباشد، چرخش رمزها می‌تواند دکمه‌های لغو دسترسی را از کار بیندازد.'
+              : '⚠️ the fingerprint key is not committed yet — until the database is reachable, rotating a secret can break the revoke buttons.'}</div>` : ''}
           ${s.locked?`<div class="bad sub" style="margin-top:8px">🔒 OWNER_LOCK=1</div>`:''}
           <div class="row" style="margin-top:12px">
             <button onclick="QV.ownerInvite()">${fa?'🔑 ساخت کد اتصال':'🔑 New claim code'}</button>
